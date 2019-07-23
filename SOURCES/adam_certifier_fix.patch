@@ -1,0 +1,150 @@
+diff --git a/plugins/experimental/certifier/certifier.cc b/plugins/experimental/certifier/certifier.cc
+index 9415d75..a7c0310 100644
+--- a/plugins/experimental/certifier/certifier.cc
++++ b/plugins/experimental/certifier/certifier.cc
+@@ -42,11 +42,18 @@
+ #include <fstream>       // ofstream
+ #include <memory>
+ #include <algorithm>
++#include <assert.h>
+ 
+ #include "ts/ts.h"
+ 
+ const char *PLUGIN_NAME = "certifier";
+ 
++template <class ReturnType, class ArgType, ReturnType (*fun)(ArgType)>
++struct HardFun {
++    ReturnType operator()(ArgType arg) { return fun(arg); }
++};
++typedef std::unique_ptr<BIGNUM, HardFun<void, BIGNUM*, &BN_free>> BIGNUM_Pointer;
++
+ /// Override default delete for unique ptrs to openSSL objects
+ namespace std
+ {
+@@ -349,6 +356,71 @@ mkcsr(const char *cn)
+   return req;
+ }
+ 
++static  BIGNUM *createCertSerial(unsigned char *md, unsigned int n)
++{
++
++    assert(n == 20); //for sha1 n is 20 (for md5 n is 16)
++
++    BIGNUM *serial = NULL;
++    serial = BN_bin2bn(md, n, NULL);
++
++    // if the serial is "0" set it to '1'
++    if (BN_is_zero(serial) == true)
++        BN_one(serial);
++
++    // serial size does not exceed 20 bytes
++    assert(BN_num_bits(serial) <= 160);
++
++    // According the RFC 5280, serial is an 20 bytes ASN.1 INTEGER (a signed big integer)
++    // and the maximum value for X.509 certificate serial number is 2^159-1 and
++    // the minimum 0. If the first bit of the serial is '1' ( eg 2^160-1),
++    // will result to a negative integer.
++    // To handle this, if the produced serial is greater than 2^159-1
++    // truncate the last bit
++    if (BN_is_bit_set(serial, 159))
++        BN_clear_bit(serial, 159);
++
++    return serial;
++}
++
++/// Return the SHA1 digest of the DER encoded version of the certificate
++/// stored in a BIGNUM
++static BIGNUM *x509Digest(const X509 *data)
++{
++    unsigned int n;
++    unsigned char md[EVP_MAX_MD_SIZE];
++
++    if (!X509_digest(data,EVP_sha1(),md,&n))
++        return NULL;
++
++    return createCertSerial(md, n);
++}
++
++/**
++ \ingroup ServerProtocolSSLInternal
++ * Set serial random serial number or set random serial number.
++ */
++static bool setSerialNumber(ASN1_INTEGER *ai, BIGNUM const* serial)
++{
++    if (!ai)
++        return false;
++    BIGNUM_Pointer bn(BN_new());
++    if (serial) {
++        bn.reset(BN_dup(serial));
++    } else {
++        if (!bn)
++            return false;
++
++        if (!BN_pseudo_rand(bn.get(), 64, 0, 0))
++            return false;
++    }
++
++    if (ai && !BN_to_ASN1_INTEGER(bn.get(), ai))
++        return false;
++    return true;
++}
++
++
+ /// Local helper function that generates a X509 certificate based on CSR
+ static scoped_X509
+ mkcrt(X509_REQ *req, int serial)
+@@ -368,7 +440,7 @@ mkcrt(X509_REQ *req, int serial)
+ 
+   /// Set serial number
+   // TSDebug("txn_monitor", "serial: %d", serial);
+-  ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), serial);
++  //ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), serial);
+ 
+   /// Set issuer from CA cert
+   if (X509_set_issuer_name(cert.get(), X509_get_subject_name(ca_cert_scoped.get())) == 0) {
+@@ -402,6 +474,45 @@ mkcrt(X509_REQ *req, int serial)
+     return nullptr;
+   }
+ 
++  // add subject cn extensions - added by adam 2019-07-10
++  //refer squid 4.7 addAltNameWithSubjectCn
++  do {
++    X509_NAME *name = X509_REQ_get_subject_name(req);
++    if (!name)
++      break;
++
++    const int loc = X509_NAME_get_index_by_NID(name, NID_commonName, -1);
++    if (loc < 0)
++      break;
++
++    ASN1_STRING *cn_data = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, loc));
++    if (!cn_data)
++      break;
++
++    char dnsName[1024]; // DNS names are limited to 256 characters
++    const int res = snprintf(dnsName, sizeof(dnsName), "DNS:%*s", cn_data->length, cn_data->data);
++    if (res <= 0 || res >= static_cast<int>(sizeof(dnsName)))
++      break;
++    //TSDebug(PLUGIN_NAME, "adam_debug dnsName %s", dnsName);
++
++    X509_EXTENSION *ext = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, dnsName);
++    if (!ext)
++      break;
++
++    (void)X509_add_ext(cert.get(), ext, -1);
++    X509_EXTENSION_free(ext);
++
++  } while (0);
++
++  // gen serial number - added by adam 2019-07-22
++  BIGNUM *new_serial = x509Digest(cert.get());
++  if (!setSerialNumber(X509_get_serialNumber(cert.get()), new_serial)) {
++    BN_free(new_serial);
++    TSError("[%s] mkcrt(): Failed to set serial number.", PLUGIN_NAME);
++    return nullptr;
++  }
++  BN_free(new_serial);
++
+   X509_sign(cert.get(), ca_pkey_scoped.get(), EVP_sha256());
+ 
+   return cert;

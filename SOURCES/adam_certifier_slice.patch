@@ -1,0 +1,4802 @@
+diff --git a/plugins/Makefile.am b/plugins/Makefile.am
+index 32e14db..a226657 100644
+--- a/plugins/Makefile.am
++++ b/plugins/Makefile.am
+@@ -50,6 +50,7 @@ include experimental/balancer/Makefile.inc
+ include experimental/buffer_upload/Makefile.inc
+ include experimental/cache_promote/Makefile.inc
+ include experimental/cache_range_requests/Makefile.inc
++include experimental/certifier/Makefile.inc
+ include experimental/cachekey/Makefile.inc
+ include experimental/collapsed_connection/Makefile.inc
+ include experimental/collapsed_forwarding/Makefile.inc
+@@ -69,6 +70,7 @@ include experimental/mp4/Makefile.inc
+ include experimental/multiplexer/Makefile.inc
+ include experimental/remap_purge/Makefile.inc
+ include experimental/ssl_cert_loader/Makefile.inc
++include experimental/slice/Makefile.inc
+ include experimental/sslheaders/Makefile.inc
+ include experimental/stale_while_revalidate/Makefile.inc
+ include experimental/stream_editor/Makefile.inc
+diff --git a/plugins/experimental/certifier/Makefile.inc b/plugins/experimental/certifier/Makefile.inc
+new file mode 100644
+index 0000000..fa12713
+--- /dev/null
++++ b/plugins/experimental/certifier/Makefile.inc
+@@ -0,0 +1,19 @@
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++pkglib_LTLIBRARIES += experimental/certifier/certifier.la
++
++experimental_certifier_certifier_la_SOURCES = experimental/certifier/certifier.cc
+diff --git a/plugins/experimental/certifier/README b/plugins/experimental/certifier/README
+new file mode 100644
+index 0000000..8d3008a
+--- /dev/null
++++ b/plugins/experimental/certifier/README
+@@ -0,0 +1,32 @@
++Certifier
++This plugin performs two basic tasks -
++
++Load SSL certificates from file storage on demand. The total number of loaded certificates can be configured.
++Generates SSL certificates on demand.
++Generated certificates can be written to file storage for later retrieval.
++
++Description
++Certifier manages SSL certificates for Traffic Server. There are two sources for certificates, certificate files in the file system and dynamically generated certificates. Dynamic certificates can be stored to the file system to avoid generating them again.
++
++Configuration
++Certifier is a global plugin and is configured by arguments in plugin.config.
++
++|Name|
++
++--sign-cert <path>
++Specify the signing certificate for dynamically generated certificates. path should be the path and file name of the certificate. If it is relative it is relative to the Traffic Server configuration directory. If this is not specified then dynamic certificate generation is disabled.
++
++--sign-key <path>
++Specify the signing key for dynamically generated certificates.
++
++--sign-serial <path>
++Specify the signing serial number from a file. Serial file should be a number with a trailing newline.
++
++--max <N>
++The maximum number of certificates to keep in memory. If more certificates are loaded the least recently used certificates are deleted from memory. This is intended to control the amount of memory used by the in memory certificate store.
++
++--store <path>
++The directory to use as the root of file system certificate store.
++
++Note:
++Use OpenSSL 1.0.2 and above.
+diff --git a/plugins/experimental/certifier/certifier.cc b/plugins/experimental/certifier/certifier.cc
+new file mode 100644
+index 0000000..9415d75
+--- /dev/null
++++ b/plugins/experimental/certifier/certifier.cc
+@@ -0,0 +1,695 @@
++/** @certifier.cc
++  This plugin performs two basic tasks:
++  1) Loads SSL certificates from file storage on demand. The total number of loaded certificates kept in memory can be configured.
++  2) (Optional) Generates SSL certificates on demand. Generated certificates are written to file storage for later retrieval.
++
++  @section license License
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++      http://www.apache.org/licenses/LICENSE-2.0
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cerrno>
++#include <getopt.h>
++
++#include <sys/stat.h>
++
++#include <openssl/ssl.h>
++#include <openssl/err.h>
++#include <openssl/pem.h>
++#include <openssl/conf.h>
++#include <openssl/x509v3.h>
++#include <openssl/x509.h>
++#include <openssl/rsa.h>
++#include <openssl/md5.h>
++
++#include <unordered_map> // cnDataMap
++#include <queue>         // vconnQ
++#include <string>        // std::string
++#include <fstream>       // ofstream
++#include <memory>
++#include <algorithm>
++
++#include "ts/ts.h"
++
++const char *PLUGIN_NAME = "certifier";
++
++/// Override default delete for unique ptrs to openSSL objects
++namespace std
++{
++template <> struct default_delete<X509> {
++  void
++  operator()(X509 *n)
++  {
++    X509_free(n);
++  }
++};
++template <> struct default_delete<X509_REQ> {
++  void
++  operator()(X509_REQ *n)
++  {
++    X509_REQ_free(n);
++  }
++};
++template <> struct default_delete<EVP_PKEY> {
++  void
++  operator()(EVP_PKEY *n)
++  {
++    EVP_PKEY_free(n);
++  }
++};
++template <> struct default_delete<SSL_CTX> {
++  void
++  operator()(SSL_CTX *n)
++  {
++    SSL_CTX_free(n);
++  }
++};
++} // namespace std
++
++/// Name aliases for unique pts to openSSL objects
++using scoped_X509     = std::unique_ptr<X509>;
++using scoped_X509_REQ = std::unique_ptr<X509_REQ>;
++using scoped_EVP_PKEY = std::unique_ptr<EVP_PKEY>;
++using scoped_SSL_CTX  = std::unique_ptr<SSL_CTX>;
++
++class SslLRUList
++{
++private:
++  struct SslData {
++    std::queue<void *> vconnQ;    ///< Current queue of connections waiting for cert
++    std::unique_ptr<SSL_CTX> ctx; ///< Context generated
++    std::unique_ptr<X509> cert;   ///< Cert generated
++    std::string commonName;       ///< SNI
++    bool scheduled = false;       ///< If a TASK thread has been scheduled to generate cert
++                                  ///< The first thread might fail to do so, this flag will help reschedule
++    bool wontdo = false;          ///< if certs not on disk and dynamic gen is disabled
++    /// Doubly Linked List pointers for LRU
++    SslData *prev = nullptr;
++    SslData *next = nullptr;
++
++    SslData() {}
++    ~SslData() { TSDebug(PLUGIN_NAME, "Deleting ssl data for [%s]", commonName.c_str()); }
++  };
++
++  using scoped_SslData = std::unique_ptr<SslLRUList::SslData>;
++
++  // unordered_map is much faster in terms of insertion/lookup/removal
++  // Althogh it uses more space than map, the time efficiency should be more important
++  std::unordered_map<std::string, scoped_SslData> cnDataMap; ///< Map from CN to sslData
++  TSMutex list_mutex;
++
++  int size = 0;
++  int limit;
++  SslData *head = nullptr;
++  SslData *tail = nullptr;
++
++public:
++  SslLRUList(int in_limit = 4096) : limit(in_limit) { list_mutex = TSMutexCreate(); }
++
++  ~SslLRUList() { TSMutexDestroy(list_mutex); }
++
++  // Returns valid ptr to SSL_CTX if successful lookup
++  //         nullptr if not found and create SslData in the map
++  SSL_CTX *
++  lookup_and_create(const char *servername, void *edata, bool &wontdo)
++  {
++    SslData *ssl_data              = nullptr;
++    scoped_SslData scoped_ssl_data = nullptr;
++    SSL_CTX *ref_ctx               = nullptr;
++    std::string commonName(servername);
++    TSMutexLock(list_mutex);
++    auto dataItr = cnDataMap.find(commonName);
++    /// If such a context exists in dict
++    if (dataItr != cnDataMap.end()) {
++      /// Reuse context if already built, self queued if not
++      if ((ssl_data = dataItr->second.get())->wontdo) {
++        wontdo = true;
++      } else if (ssl_data->ctx) {
++        ref_ctx = ssl_data->ctx.get();
++      } else {
++        ssl_data->vconnQ.push(edata);
++      }
++    } else {
++      /// Add a new ssl_data to dict if not exist
++      scoped_ssl_data.reset(new SslData);
++      ssl_data             = scoped_ssl_data.get();
++      ssl_data->commonName = std::move(commonName);
++      ssl_data->vconnQ.push(edata);
++
++      cnDataMap[ssl_data->commonName] = std::move(scoped_ssl_data);
++    }
++    // With a valid sslData pointer
++    if (ssl_data != nullptr) {
++      // Add to the list and set scheduled flag
++      prepend(ssl_data);
++      if (ref_ctx == nullptr || !ssl_data->scheduled) {
++        ssl_data->scheduled = true;
++      }
++    }
++    TSMutexUnlock(list_mutex);
++    return ref_ctx;
++  }
++
++  // Setup ssldata 1) ctx 2) cert 3) swapping queue
++  // Ownership of unique pointers are transferred into this function
++  // Then if the entry is found, the ownership is further transferred to the entry
++  // if not, the objects are destroyed here. (As per design, this is caused by LRU management deleting oldest entry)
++  void
++  setup_data_ctx(const std::string &commonName, std::queue<void *> &localQ, std::unique_ptr<SSL_CTX> ctx,
++                 std::unique_ptr<X509> cert, const bool &wontdo)
++  {
++    TSMutexLock(list_mutex);
++    auto iter = cnDataMap.find(commonName);
++    if (iter != cnDataMap.end()) {
++      std::swap(localQ, iter->second->vconnQ);
++      iter->second->ctx    = std::move(ctx);
++      iter->second->cert   = std::move(cert); ///< We might not need cert, can be easily removed
++      iter->second->wontdo = wontdo;
++    }
++    TSMutexUnlock(list_mutex);
++  }
++
++  // Prepend to the LRU list
++  void
++  prepend(SslData *data)
++  {
++    TSMutexLock(list_mutex);
++    std::unique_ptr<SslData> local = nullptr;
++    if (data != nullptr) {
++      // If data is the most recent node in the list,
++      // we leave it unchanged.
++      if (head != data) {
++        // Remove data from the list (does size decrement)
++        remove_from_list(data);
++
++        // Prepend to head
++        data->prev = nullptr;
++        data->next = head;
++        if (data->next != nullptr) {
++          data->next->prev = data;
++        }
++        head = data;
++        if (tail == nullptr) {
++          tail = data;
++        }
++
++        // Remove oldest node if size exceeds limit
++        if (++size > limit) {
++          TSDebug(PLUGIN_NAME, "Removing %s", tail->commonName.c_str());
++          auto iter = cnDataMap.find(tail->commonName);
++          if (iter != cnDataMap.end()) {
++            local = std::move(iter->second); // copy ownership
++            cnDataMap.erase(iter);
++          }
++          if ((tail = tail->prev) != nullptr) {
++            tail->next = nullptr;
++          }
++          size -= 1;
++        }
++      }
++    }
++    TSDebug(PLUGIN_NAME, "%s Prepend to LRU list...List Size:%d Map Size: %d", data->commonName.c_str(), size,
++            static_cast<int>(cnDataMap.size()));
++
++    TSMutexUnlock(list_mutex);
++  }
++
++  // Remove list node
++  void
++  remove_from_list(SslData *data)
++  {
++    TSMutexLock(list_mutex);
++    // If data and list are both valid
++    if (data != nullptr) {
++      // If data is linked in list
++      if (data->prev != nullptr || data->next != nullptr || head == data) {
++        if (data->prev != nullptr) {
++          data->prev->next = data->next;
++        }
++        if (data->next != nullptr) {
++          data->next->prev = data->prev;
++        }
++        if (head == data) {
++          head = data->next;
++        }
++        if (tail == data) {
++          tail = data->prev;
++        }
++        data->prev = nullptr;
++        data->next = nullptr;
++        size -= 1;
++      }
++    }
++    TSMutexUnlock(list_mutex);
++  }
++
++  SslData *
++  get_newest()
++  {
++    TSMutexLock(list_mutex);
++    SslData *ret = head;
++    TSMutexUnlock(list_mutex);
++    return ret;
++  }
++
++  SslData *
++  get_oldest()
++  {
++    TSMutexLock(list_mutex);
++    SslData *ret = tail;
++    TSMutexUnlock(list_mutex);
++    return ret;
++  }
++
++  int
++  get_size()
++  {
++    TSMutexLock(list_mutex);
++    int ret = size;
++    TSMutexUnlock(list_mutex);
++    return ret;
++  }
++
++  // Set scheduled flag
++  int
++  set_schedule(const std::string &commonName, bool flag)
++  {
++    int ret = -1;
++    TSMutexLock(list_mutex);
++    auto iter = cnDataMap.find(commonName);
++    if (iter != cnDataMap.end()) {
++      iter->second->scheduled = flag;
++      ret                     = 0;
++    }
++    TSMutexUnlock(list_mutex);
++    return ret;
++  }
++};
++
++// Flag for dynamic cert generation
++static bool sign_enabled = false;
++
++// Trusted CA private key and cert
++static scoped_X509 ca_cert_scoped;
++static scoped_EVP_PKEY ca_pkey_scoped;
++// static scoped_EVP_PKEY  ts_pkey_scoped;
++
++static int ca_serial;            ///< serial number
++static std::fstream serial_file; ///< serial number file
++static TSMutex serial_mutex;     ///< serial number mutex
++
++// Management Object
++static std::unique_ptr<SslLRUList> ssl_list = nullptr;
++static std::string store_path;
++
++/// Local helper function that generates a CSR based on common name
++static scoped_X509_REQ
++mkcsr(const char *cn)
++{
++  TSDebug(PLUGIN_NAME, "Entering mkcsr()...");
++  X509_NAME *n;
++  scoped_X509_REQ req;
++  req.reset(X509_REQ_new());
++
++  /// Set X509 version
++  X509_REQ_set_version(req.get(), 1);
++
++  /// Get handle to subject name
++  n = X509_REQ_get_subject_name(req.get());
++
++  /// Set common name field
++  if (X509_NAME_add_entry_by_txt(n, "CN", MBSTRING_ASC, (unsigned char *)cn, -1, -1, 0) != 1) {
++    TSError("[%s] mkcsr(): Failed to add entry.", PLUGIN_NAME);
++    return nullptr;
++  }
++  /// Set Traffic Server public key
++  if (X509_REQ_set_pubkey(req.get(), ca_pkey_scoped.get()) != 1) {
++    TSError("[%s] mkcsr(): Failed to set pubkey.", PLUGIN_NAME);
++    return nullptr;
++  }
++  /// Sign with Traffic Server private key
++  if (X509_REQ_sign(req.get(), ca_pkey_scoped.get(), EVP_sha256()) <= 0) {
++    TSError("[%s] mkcsr(): Failed to Sign.", PLUGIN_NAME);
++    return nullptr;
++  }
++  return req;
++}
++
++/// Local helper function that generates a X509 certificate based on CSR
++static scoped_X509
++mkcrt(X509_REQ *req, int serial)
++{
++  TSDebug(PLUGIN_NAME, "Entering mkcrt()...");
++  X509_NAME *subj, *tmpsubj;
++  scoped_EVP_PKEY pktmp;
++  scoped_X509 cert;
++
++  cert.reset(X509_new());
++
++  /// Set X509V3
++  if (X509_set_version(cert.get(), 2) == 0) {
++    TSError("[%s] mkcrt(): Failed to set X509V3.", PLUGIN_NAME);
++    return nullptr;
++  }
++
++  /// Set serial number
++  // TSDebug("txn_monitor", "serial: %d", serial);
++  ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), serial);
++
++  /// Set issuer from CA cert
++  if (X509_set_issuer_name(cert.get(), X509_get_subject_name(ca_cert_scoped.get())) == 0) {
++    TSError("[%s] mkcrt(): Failed to set issuer.", PLUGIN_NAME);
++    return nullptr;
++  }
++  /// Set certificate time
++  X509_gmtime_adj(X509_get_notBefore(cert.get()), 0);
++  X509_gmtime_adj(X509_get_notAfter(cert.get()), (long)3650 * 24 * 3600);
++
++  /// Get a handle to csr subject name
++  subj = X509_REQ_get_subject_name(req);
++  if ((tmpsubj = X509_NAME_dup(subj)) == nullptr) {
++    TSDebug(PLUGIN_NAME, "mkcrt(): Failed to duplicate subject name.");
++    return nullptr;
++  }
++  if ((X509_set_subject_name(cert.get(), tmpsubj)) == 0) {
++    TSDebug(PLUGIN_NAME, "mkcrt(): Failed to set X509 subject name");
++    X509_NAME_free(tmpsubj); ///< explicit call to free X509_NAME object
++    return nullptr;
++  }
++  pktmp.reset(X509_REQ_get_pubkey(req));
++  if (pktmp == nullptr) {
++    TSDebug(PLUGIN_NAME, "mkcrt(): Failed to get CSR public key.");
++    X509_NAME_free(tmpsubj);
++    return nullptr;
++  }
++  if (X509_set_pubkey(cert.get(), pktmp.get()) == 0) {
++    TSDebug(PLUGIN_NAME, "mkcrt(): Failed to set X509 public key.");
++    X509_NAME_free(tmpsubj);
++    return nullptr;
++  }
++
++  X509_sign(cert.get(), ca_pkey_scoped.get(), EVP_sha256());
++
++  return cert;
++}
++
++static int
++shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
++{
++  const char *servername = reinterpret_cast<const char *>(TSContDataGet(contp));
++  std::string commonName(servername);
++
++  std::queue<void *> localQ;
++  SSL_CTX *ref_ctx;
++  scoped_SSL_CTX ctx;
++  scoped_X509_REQ req;
++  scoped_X509 cert;
++
++  /// Calculate hash and path, try certs on disk first
++  unsigned char digest[MD5_DIGEST_LENGTH];
++  MD5(reinterpret_cast<unsigned char const *>(commonName.data()), commonName.length(), digest);
++  char md5String[5];
++  sprintf(md5String, "%02hhx%02hhx", digest[0], digest[1]);
++  std::string path          = store_path + "/" + std::string(md5String, 3);
++  std::string cert_filename = path + '/' + commonName + ".crt";
++
++  struct stat st;
++  FILE *fp = nullptr;
++  /// If directory doesn't exist, creat one
++  if (stat(path.c_str(), &st) == -1) {
++    mkdir(path.c_str(), 0755);
++  } else {
++    /// Try open the file if directory exists
++    fp = fopen(cert_filename.c_str(), "rt");
++  }
++  TSDebug(PLUGIN_NAME, "shadow_cert_generator(): Cert file is expected at %s", cert_filename.c_str());
++  /// If cert file exists and is readable
++  if (fp != nullptr) {
++    cert.reset(PEM_read_X509(fp, nullptr, nullptr, nullptr));
++    fclose(fp);
++
++    if (cert == nullptr) {
++      /// Problem with cert file / openssl read
++      TSError("[%s] [shadow_cert_generator] Problem with loading certs", PLUGIN_NAME);
++      std::remove(cert_filename.c_str());
++    } else {
++      TSDebug(PLUGIN_NAME, "shadow_cert_generator(): Loaded cert from file");
++    }
++  }
++
++  /// No valid certs available from disk, create one and write to file
++  if (cert == nullptr) {
++    if (!sign_enabled) {
++      TSDebug(PLUGIN_NAME, "shadow_cert_generator(): No certs found and dynamic generation disabled. Marked as wontdo.");
++      // There won't be certs avaiable. Mark this servername as wontdo
++      // Pass on as if plugin doesn't exist
++      ssl_list->setup_data_ctx(commonName, localQ, nullptr, nullptr, true);
++      while (!localQ.empty()) {
++        // TSDebug(PLUGIN_NAME, "\tClearing the queue size %lu", localQ.size());
++        TSVConn ssl_vc = reinterpret_cast<TSVConn>(localQ.front());
++        localQ.pop();
++        TSVConnReenable(ssl_vc);
++      }
++      TSContDestroy(contp);
++      return TS_SUCCESS;
++    }
++    TSDebug(PLUGIN_NAME, "shadow_cert_generator(): Creating shadow certs");
++
++    /// Get serial number
++    TSMutexLock(serial_mutex);
++    int serial = ca_serial++;
++
++    /// Write to serial file with lock held
++    if (serial_file) {
++      serial_file.seekp(0, serial_file.beg); ///< Reset to beginning fo file
++      serial_file << serial << "\n";
++    }
++
++    TSMutexUnlock(serial_mutex);
++
++    /// Create CSR and cert
++    req = mkcsr(commonName.c_str());
++    if (req == nullptr) {
++      TSDebug(PLUGIN_NAME, "[shadow_cert_generator] CSR generation failed");
++      TSContDestroy(contp);
++      ssl_list->set_schedule(commonName, false);
++      return TS_ERROR;
++    }
++
++    cert = mkcrt(req.get(), serial);
++
++    if (cert == nullptr) {
++      TSDebug(PLUGIN_NAME, "[shadow_cert_generator] Cert generation failed");
++      TSContDestroy(contp);
++      ssl_list->set_schedule(commonName, false);
++      return TS_ERROR;
++    }
++
++    /// Write certs to file
++    if ((fp = fopen(cert_filename.c_str(), "w+")) == nullptr) {
++      TSDebug(PLUGIN_NAME, "shadow_cert_generator(): Error opening file: %s\n", strerror(errno));
++    } else {
++      if (!PEM_write_X509(fp, cert.get())) {
++        TSDebug(PLUGIN_NAME, "shadow_cert_generator(): Error writing cert to disk");
++      }
++      fclose(fp);
++    }
++  }
++
++  /// Create SSL context based on cert
++  ref_ctx = SSL_CTX_new(SSLv23_server_method());
++  ctx.reset(ref_ctx);
++
++  if (SSL_CTX_use_certificate(ref_ctx, cert.get()) < 1) {
++    TSError("[%s] shadow_cert_handler(): Failed to use certificate in SSL_CTX.", PLUGIN_NAME);
++    TSContDestroy(contp);
++    ssl_list->set_schedule(commonName, false);
++    return TS_ERROR;
++  }
++  if (SSL_CTX_use_PrivateKey(ref_ctx, ca_pkey_scoped.get()) < 1) {
++    TSError("[%s] shadow_cert_handler(): Failed to use private key in SSL_CTX.", PLUGIN_NAME);
++    TSContDestroy(contp);
++    ssl_list->set_schedule(commonName, false);
++    return TS_ERROR;
++  }
++  TSDebug(PLUGIN_NAME, "shadow_cert_generator(): cert and context ready, clearing the queue");
++  ssl_list->setup_data_ctx(commonName, localQ, std::move(ctx), std::move(cert), false);
++
++  /// Clear the queue by setting context for each and reenable them
++  while (!localQ.empty()) {
++    TSDebug(PLUGIN_NAME, "\tClearing the queue size %lu", localQ.size());
++    TSVConn ssl_vc = reinterpret_cast<TSVConn>(localQ.front());
++    localQ.pop();
++    TSSslConnection sslobj = TSVConnSSLConnectionGet(ssl_vc);
++    SSL *ssl               = reinterpret_cast<SSL *>(sslobj);
++    SSL_set_SSL_CTX(ssl, ref_ctx);
++    TSVConnReenable(ssl_vc);
++  }
++
++  TSContDestroy(contp);
++  return TS_SUCCESS;
++}
++
++/// Callback at TS_SSL_CERT_HOOK, generate/look up shadow certificates based on SNI/FQDN
++static int
++cert_retriever(TSCont contp, TSEvent event, void *edata)
++{
++  TSVConn ssl_vc         = reinterpret_cast<TSVConn>(edata);
++  TSSslConnection sslobj = TSVConnSSLConnectionGet(ssl_vc);
++  SSL *ssl               = reinterpret_cast<SSL *>(sslobj);
++  const char *servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
++  SSL_CTX *ref_ctx       = nullptr;
++
++  if (servername == nullptr) {
++    TSError("[%s] cert_retriever(): No SNI available.", PLUGIN_NAME);
++    return TS_ERROR;
++  }
++  bool wontdo = false;
++  ref_ctx     = ssl_list->lookup_and_create(servername, edata, wontdo);
++  if (wontdo) {
++    TSDebug(PLUGIN_NAME, "cert_retriever(): Won't generate cert for %s", servername);
++    TSVConnReenable(ssl_vc);
++  } else if (nullptr == ref_ctx) {
++    // If no existing context, schedule TASK thread to generate
++    TSDebug(PLUGIN_NAME, "cert_retriever(): schedule thread to generate/retrieve cert for %s", servername);
++    TSCont schedule_cont = TSContCreate(shadow_cert_generator, TSMutexCreate());
++    TSContDataSet(schedule_cont, (void *)servername);
++    TSContSchedule(schedule_cont, 0, TS_THREAD_POOL_TASK);
++  } else {
++    // Use existing context
++    TSDebug(PLUGIN_NAME, "cert_retriever(): Reuse existing cert and context for %s", servername);
++    SSL_set_SSL_CTX(ssl, ref_ctx);
++    TSVConnReenable(ssl_vc);
++  }
++
++  /// For scheduled connections, the schduled continuation will handle the reenabling
++  return TS_SUCCESS;
++}
++
++void
++TSPluginInit(int argc, const char *argv[])
++{
++  TSDebug(PLUGIN_NAME, "initializing plugin");
++  // Initialization data and callback
++  TSPluginRegistrationInfo info;
++  TSCont cb_shadow   = nullptr;
++  info.plugin_name   = "certifier";
++  info.vendor_name   = "Apache Software Foundation";
++  info.support_email = "dev@trafficserver.apache.org";
++
++  const char *key    = nullptr;
++  const char *cert   = nullptr;
++  const char *serial = nullptr;
++
++  // Read options from plugin.config
++  static const struct option longopts[] = {
++    {"sign-cert", required_argument, nullptr, 'c'},   {"sign-key", required_argument, nullptr, 'k'},
++    {"sign-serial", required_argument, nullptr, 'r'}, {"max", required_argument, nullptr, 'm'},
++    {"store", required_argument, nullptr, 's'},       {nullptr, no_argument, nullptr, 0}};
++
++  int opt = 0;
++
++  while (opt >= 0) {
++    opt = getopt_long(argc, (char *const *)argv, "c:k:r:m:s:", longopts, nullptr);
++    switch (opt) {
++    case 'c': {
++      cert = optarg;
++      break;
++    }
++    case 'k': {
++      key = optarg;
++      break;
++    }
++    case 'r': {
++      serial = optarg;
++      break;
++    }
++    case 'm': {
++      ssl_list.reset(new SslLRUList(static_cast<int>(std::strtol(optarg, nullptr, 0))));
++      break;
++    }
++    case 's': {
++      store_path = std::string(optarg);
++      break;
++    }
++    case -1:
++    case '?':
++      break;
++    default:
++      TSDebug(PLUGIN_NAME, "Unexpected options.");
++      TSError("[%s] Unexpected options error.", PLUGIN_NAME);
++      return;
++    }
++  }
++
++  // Register plugin and create callback
++  if (TSPluginRegister(&info) != TS_SUCCESS) {
++    TSError("[%s] Unable to initialize plugin (disabled). Failed to register plugin.", PLUGIN_NAME);
++  } else if ((cb_shadow = TSContCreate(cert_retriever, nullptr)) == nullptr) {
++    TSError("[%s] Unable to initialize plugin (disabled). Failed to create shadow cert cb.", PLUGIN_NAME);
++  } else {
++    if ((sign_enabled = cert && key && serial)) {
++      // Dynamic cert generation enabled. Initialize CA key, cert and serial
++      // To comply to openssl, key and cert file are opened as FILE*
++      FILE *fp = nullptr;
++      if ((fp = fopen(cert, "rt")) == nullptr) {
++        TSDebug(PLUGIN_NAME, "fopen() error is %d: %s for %s", errno, strerror(errno), cert);
++        TSError("[%s] Unable to initialize plugin. Failed to open ca cert.", PLUGIN_NAME);
++        return;
++      }
++      ca_cert_scoped.reset(PEM_read_X509(fp, nullptr, nullptr, nullptr));
++      fclose(fp);
++
++      if ((fp = fopen(key, "rt")) == nullptr) {
++        TSDebug(PLUGIN_NAME, "fopen() error is %d: %s for %s", errno, strerror(errno), key);
++        TSError("[%s] Unable to initialize plugin. Failed to open ca key.", PLUGIN_NAME);
++        return;
++      }
++      ca_pkey_scoped.reset(PEM_read_PrivateKey(fp, nullptr, nullptr, nullptr));
++      fclose(fp);
++
++      if (ca_pkey_scoped == nullptr || ca_cert_scoped == nullptr) {
++        TSDebug(PLUGIN_NAME, "PEM_read failed to read %s %s", ca_pkey_scoped ? "" : "pkey", ca_cert_scoped ? "" : "cert");
++        TSError("[%s] Unable to initialize plugin. Failed to read ca key/cert.", PLUGIN_NAME);
++        return;
++      }
++
++      // Read serial file
++      serial_file.open(serial, std::fstream::in | std::fstream::out);
++      if (!serial_file.is_open()) {
++        TSDebug(PLUGIN_NAME, "Failed to open serial file.");
++        TSError("[%s] Unable to initialize plugin. Failed to open serial.", PLUGIN_NAME);
++        return;
++      }
++      /// Initialize mutex and serial number
++      serial_mutex = TSMutexCreate();
++      ca_serial    = 0;
++
++      serial_file.seekg(0, serial_file.beg);
++      serial_file >> ca_serial;
++      if (serial_file.bad() || serial_file.fail()) {
++        ca_serial = 0;
++      }
++    }
++    TSDebug(PLUGIN_NAME, "Dynamic cert generation %s", sign_enabled ? "enabled" : "disabled");
++
++    /// Add global hooks
++    TSHttpHookAdd(TS_SSL_CERT_HOOK, cb_shadow);
++  }
++
++  return;
++}
+diff --git a/plugins/experimental/slice/Config.cc b/plugins/experimental/slice/Config.cc
+new file mode 100644
+index 0000000..2a6ed11
+--- /dev/null
++++ b/plugins/experimental/slice/Config.cc
+@@ -0,0 +1,193 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "Config.h"
++
++#include <cctype>
++#include <cinttypes>
++#include <cstdlib>
++#include <getopt.h>
++#include <string>
++
++#include "ts/experimental.h"
++
++int64_t
++Config::bytesFrom(char const *const valstr)
++{
++  char *endptr       = nullptr;
++  int64_t blockbytes = strtoll(valstr, &endptr, 10);
++
++  if (nullptr != endptr && valstr < endptr) {
++    size_t const dist = endptr - valstr;
++    if (dist < strlen(valstr) && 0 <= blockbytes) {
++      switch (tolower(*endptr)) {
++      case 'g':
++        blockbytes *= ((int64_t)1024 * (int64_t)1024 * (int64_t)1024);
++        break;
++      case 'm':
++        blockbytes *= ((int64_t)1024 * (int64_t)1024);
++        break;
++      case 'k':
++        blockbytes *= (int64_t)1024;
++        break;
++      default:
++        break;
++      }
++    }
++  }
++
++  if (blockbytes < 0) {
++    blockbytes = 0;
++  }
++
++  return blockbytes;
++}
++
++bool
++Config::fromArgs(int const argc, char const *const argv[])
++{
++  DEBUG_LOG("Number of arguments: %d", argc);
++  for (int index = 0; index < argc; ++index) {
++    DEBUG_LOG("args[%d] = %s", index, argv[index]);
++  }
++
++  // current "best" blockbytes from configuration
++  int64_t blockbytes = 0;
++
++  // backwards compat: look for blockbytes
++  for (int index = 0; index < argc; ++index) {
++    std::string const argstr = argv[index];
++
++    std::size_t const spos = argstr.find_first_of(':');
++    if (spos != std::string::npos) {
++      std::string const key = argstr.substr(0, spos);
++      std::string const val = argstr.substr(spos + 1);
++
++      if (!key.empty() && !val.empty()) {
++        char const *const valstr = val.data(); // inherits argv's null
++        int64_t const bytesread  = bytesFrom(valstr);
++
++        if (blockbytesmin <= bytesread && bytesread <= blockbytesmax) {
++          DEBUG_LOG("Found deprecated blockbytes %" PRId64, bytesread);
++          blockbytes = bytesread;
++        }
++      }
++    }
++  }
++
++  // standard parsing
++  constexpr const struct option longopts[] = {
++    {const_cast<char *>("blockbytes"), required_argument, nullptr, 'b'},
++    {const_cast<char *>("test-blockbytes"), required_argument, nullptr, 't'},
++    {const_cast<char *>("pace-errorlog"), required_argument, nullptr, 'p'},
++    {const_cast<char *>("disable-errorlog"), no_argument, nullptr, 'd'},
++    {nullptr, 0, nullptr, 0},
++  };
++
++  // getopt assumes args start at '1' so this hack is needed
++  char *const *argvp = ((char *const *)argv - 1);
++
++  for (;;) {
++    int const opt = getopt_long(argc + 1, argvp, "b:t:p:d", longopts, nullptr);
++    if (-1 == opt) {
++      break;
++    }
++
++    DEBUG_LOG("processing '%c' %s", (char)opt, argvp[optind - 1]);
++
++    switch (opt) {
++    case 'b': {
++      int64_t const bytesread = bytesFrom(optarg);
++      if (blockbytesmin <= bytesread && bytesread <= blockbytesmax) {
++        DEBUG_LOG("Using blockbytes %" PRId64, bytesread);
++        blockbytes = bytesread;
++      } else {
++        ERROR_LOG("Invalid blockbytes: %s", optarg);
++      }
++    } break;
++    case 't':
++      if (0 == blockbytes) {
++        int64_t const bytesread = bytesFrom(optarg);
++        if (0 < bytesread) {
++          DEBUG_LOG("Using blockbytestest %" PRId64, bytesread);
++          blockbytes = bytesread;
++        } else {
++          ERROR_LOG("Invalid blockbytestest: %s", optarg);
++        }
++      } else {
++        DEBUG_LOG("Skipping blockbytestest in favor of blockbytes");
++      }
++      break;
++    case 'p': {
++      int const secsread = atoi(optarg);
++      if (0 < secsread) {
++        m_paceerrsecs = std::min(secsread, 60);
++      } else {
++        DEBUG_LOG("Ignoring pace-errlog argument");
++      }
++    } break;
++    case 'd':
++      m_paceerrsecs = -1;
++      break;
++    default:
++      break;
++    }
++  }
++
++  if (0 < blockbytes) {
++    DEBUG_LOG("Using configured blockbytes %" PRId64, blockbytes);
++    m_blockbytes = blockbytes;
++  } else {
++    DEBUG_LOG("Using default blockbytes %" PRId64, m_blockbytes);
++  }
++
++  if (m_paceerrsecs < 0) {
++    DEBUG_LOG("Block stitching error logs disabled");
++  } else if (0 == m_paceerrsecs) {
++    DEBUG_LOG("Block stitching error logs enabled");
++  } else {
++    DEBUG_LOG("Block stitching error logs at most every %d sec(s)", m_paceerrsecs);
++  }
++
++  return true;
++}
++
++bool
++Config::canLogError()
++{
++  std::lock_guard<std::mutex> const guard(m_mutex);
++
++  if (m_paceerrsecs < 0) {
++    return false;
++  } else if (0 == m_paceerrsecs) {
++    return true;
++  }
++
++#if !defined(UNITTEST)
++  TSHRTime const timenow = TShrtime();
++  if (timenow < m_nextlogtime) {
++    return false;
++  }
++
++  m_nextlogtime = timenow + TS_HRTIME_SECONDS(m_paceerrsecs);
++#else
++  m_nextlogtime = 0; // thanks clang
++#endif
++
++  return true;
++}
+diff --git a/plugins/experimental/slice/Config.h b/plugins/experimental/slice/Config.h
+new file mode 100644
+index 0000000..8c4ab24
+--- /dev/null
++++ b/plugins/experimental/slice/Config.h
+@@ -0,0 +1,46 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "slice.h"
++
++#include <mutex>
++
++// Data Structures and Classes
++struct Config {
++  static constexpr int64_t const blockbytesmin     = 1024 * 256;       // 256KB
++  static constexpr int64_t const blockbytesmax     = 1024 * 1024 * 32; // 32MB
++  static constexpr int64_t const blockbytesdefault = 1024 * 1024;      // 1MB
++
++  int64_t m_blockbytes{blockbytesdefault};
++  int m_paceerrsecs{0}; // -1 disable logging, 0 no pacing, max 60s
++
++  // Convert optarg to bytes
++  static int64_t bytesFrom(char const *const valstr);
++
++  // Parse from args, ast one wins
++  bool fromArgs(int const argc, char const *const argv[]);
++
++  // Check if the error should can be logged, if sucessful may update m_nexttime
++  bool canLogError();
++
++private:
++  TSHRTime m_nextlogtime{0}; // next time to log in ns
++  std::mutex m_mutex;
++};
+diff --git a/plugins/experimental/slice/ContentRange.cc b/plugins/experimental/slice/ContentRange.cc
+new file mode 100644
+index 0000000..c9d9edd
+--- /dev/null
++++ b/plugins/experimental/slice/ContentRange.cc
+@@ -0,0 +1,55 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "ContentRange.h"
++
++#include <cinttypes>
++#include <cstdio>
++
++static char const *const format = "bytes %" PRId64 "-%" PRId64 "/%" PRId64;
++
++bool
++ContentRange::fromStringClosed(char const *const valstr)
++{
++  int const fields = sscanf(valstr, format, &m_beg, &m_end, &m_length);
++
++  if (3 == fields && m_beg <= m_end) {
++    m_end += 1;
++  } else {
++    m_beg = m_end = m_length = -1;
++  }
++
++  return isValid();
++}
++
++bool
++ContentRange::toStringClosed(char *const rangestr, int *const rangelen) const
++{
++  if (!isValid()) {
++    if (0 < *rangelen) {
++      rangestr[0] = '\0';
++    }
++    *rangelen = 0;
++    return false;
++  }
++
++  int const lenin = *rangelen;
++  *rangelen       = snprintf(rangestr, lenin, format, m_beg, (m_end - 1), m_length);
++
++  return (0 < *rangelen && *rangelen < lenin);
++}
+diff --git a/plugins/experimental/slice/ContentRange.h b/plugins/experimental/slice/ContentRange.h
+new file mode 100644
+index 0000000..2412e66
+--- /dev/null
++++ b/plugins/experimental/slice/ContentRange.h
+@@ -0,0 +1,53 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "ts/ts.h"
++
++/**
++  represents value parsed from a blocked Content-Range response header field.
++  Range is converted from closed range into a half open range for.
++ */
++struct ContentRange {
++  int64_t m_beg    = -1;
++  int64_t m_end    = -1; // half open
++  int64_t m_length = -1; // full content length
++
++  ContentRange() {}
++  explicit ContentRange(int64_t const begin, int64_t const end, int64_t const len) : m_beg(begin), m_end(end), m_length(len) {}
++  bool
++  isValid() const
++  {
++    return 0 <= m_beg && m_beg < m_end && m_end <= m_length;
++  }
++
++  /** parsed from a Content-Range field
++   */
++  bool fromStringClosed(char const *const valstr);
++
++  /** usable for Content-Range field
++   */
++  bool toStringClosed(char *const rangestr, int *const rangelen) const;
++
++  int64_t
++  rangeSize() const
++  {
++    return m_end - m_beg;
++  }
++};
+diff --git a/plugins/experimental/slice/Data.cc b/plugins/experimental/slice/Data.cc
+new file mode 100644
+index 0000000..aac6943
+--- /dev/null
++++ b/plugins/experimental/slice/Data.cc
+@@ -0,0 +1,65 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "Data.h"
++
++#include <cassert>
++#include <chrono>
++#include <iostream>
++#include <mutex>
++#include <thread>
++
++namespace
++{
++std::mutex mutex;
++int64_t inplay = 0;
++std::unique_ptr<std::thread> thread;
++} // namespace
++
++void
++monitor()
++{
++  std::lock_guard<std::mutex> guard(mutex);
++  //	while (0 < inplay)
++  while (true) {
++    mutex.unlock();
++    std::this_thread::sleep_for(std::chrono::seconds(10));
++    std::cerr << "Inplay: " << inplay << std::endl;
++    mutex.lock();
++  }
++  //	thread.release();
++}
++
++void
++incrData()
++{
++  std::lock_guard<std::mutex> const guard(mutex);
++  if (!thread) {
++    thread.reset(new std::thread(monitor));
++  }
++
++  ++inplay;
++}
++
++void
++decrData()
++{
++  std::lock_guard<std::mutex> const guard(mutex);
++  --inplay;
++  assert(0 <= inplay);
++}
+diff --git a/plugins/experimental/slice/Data.h b/plugins/experimental/slice/Data.h
+new file mode 100644
+index 0000000..4538352
+--- /dev/null
++++ b/plugins/experimental/slice/Data.h
+@@ -0,0 +1,126 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "ts/ts.h"
++
++#include "Config.h"
++#include "HttpHeader.h"
++#include "Range.h"
++#include "Stage.h"
++
++#include <netinet/in.h>
++
++void incrData();
++
++void decrData();
++
++struct Data {
++  Data(Data const &) = delete;
++  Data &operator=(Data const &) = delete;
++
++  Config *const m_config;
++
++  sockaddr_storage m_client_ip;
++
++  // for pristine url coming in
++  TSMBuffer m_urlbuffer{nullptr};
++  TSMLoc m_urlloc{nullptr};
++
++  char m_hostname[8192];
++  int m_hostlen;
++  char m_etag[8192];
++  int m_etaglen;
++  char m_lastmodified[8192];
++  int m_lastmodifiedlen;
++
++  TSHttpStatus m_statustype; // 200 or 206
++
++  bool m_bail; // non 206/200 response
++
++  Range m_req_range; // converted to half open interval
++  int64_t m_contentlen;
++
++  int64_t m_blocknum;      // block number to work on, -1 bad/stop
++  int64_t m_blockexpected; // body bytes expected
++  int64_t m_blockskip;     // number of bytes to skip in this block
++  int64_t m_blockconsumed; // body bytes consumed
++  bool m_iseos;            // server in EOS state
++
++  int64_t m_bytestosend; // header + content bytes to send
++  int64_t m_bytessent;   // number of bytes written to the client
++
++  bool m_server_block_header_parsed;
++  bool m_server_first_header_parsed;
++
++  Stage m_upstream;
++  Stage m_dnstream;
++
++  HdrMgr m_req_hdrmgr;  // manager for server request
++  HdrMgr m_resp_hdrmgr; // manager for client response
++
++  TSHttpParser m_http_parser{nullptr}; //!< cached for reuse
++
++  explicit Data(Config *const config)
++    : m_config(config),
++      m_client_ip(),
++      m_urlbuffer(nullptr),
++      m_urlloc(nullptr),
++      m_hostlen(0),
++      m_etaglen(0),
++      m_lastmodifiedlen(0),
++      m_statustype(TS_HTTP_STATUS_NONE),
++      m_bail(false),
++      m_req_range(-1, -1),
++      m_contentlen(-1)
++
++      ,
++      m_blocknum(-1),
++      m_blockexpected(0),
++      m_blockskip(0),
++      m_blockconsumed(0),
++      m_iseos(false)
++
++      ,
++      m_bytestosend(0),
++      m_bytessent(0),
++      m_server_block_header_parsed(false),
++      m_server_first_header_parsed(false),
++      m_http_parser(nullptr)
++  {
++    // incrData();
++    m_hostname[0]     = '\0';
++    m_lastmodified[0] = '\0';
++    m_etag[0]         = '\0';
++  }
++
++  ~Data()
++  {
++    // decrData();
++    if (nullptr != m_urlbuffer) {
++      if (nullptr != m_urlloc) {
++        TSHandleMLocRelease(m_urlbuffer, TS_NULL_MLOC, m_urlloc);
++      }
++      TSMBufferDestroy(m_urlbuffer);
++    }
++    if (nullptr != m_http_parser) {
++      TSHttpParserDestroy(m_http_parser);
++    }
++  }
++};
+diff --git a/plugins/experimental/slice/HttpHeader.cc b/plugins/experimental/slice/HttpHeader.cc
+new file mode 100644
+index 0000000..3323705
+--- /dev/null
++++ b/plugins/experimental/slice/HttpHeader.cc
+@@ -0,0 +1,356 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "HttpHeader.h"
++
++#include "slice.h"
++
++#include <cstdlib>
++#include <cstring>
++
++TSHttpType
++HttpHeader::type() const
++{
++  if (isValid()) {
++    return TSHttpHdrTypeGet(m_buffer, m_lochdr);
++  } else {
++    return TS_HTTP_TYPE_UNKNOWN;
++  }
++}
++
++TSHttpStatus
++HttpHeader::status() const
++{
++  TSHttpStatus res = TS_HTTP_STATUS_NONE;
++  if (isValid()) {
++    res = TSHttpHdrStatusGet(m_buffer, m_lochdr);
++  }
++  return res;
++}
++
++bool
++HttpHeader::setStatus(TSHttpStatus const newstatus)
++{
++  if (!isValid()) {
++    return false;
++  }
++
++  return TS_SUCCESS == TSHttpHdrStatusSet(m_buffer, m_lochdr, newstatus);
++}
++
++char *
++HttpHeader ::urlString(int *const urllen) const
++{
++  char *urlstr = nullptr;
++  TSAssert(nullptr != urllen);
++
++  TSMLoc locurl            = nullptr;
++  TSReturnCode const rcode = TSHttpHdrUrlGet(m_buffer, m_lochdr, &locurl);
++  if (TS_SUCCESS == rcode && nullptr != locurl) {
++    urlstr = TSUrlStringGet(m_buffer, locurl, urllen);
++    TSHandleMLocRelease(m_buffer, m_lochdr, locurl);
++  } else {
++    *urllen = 0;
++  }
++
++  return urlstr;
++}
++
++bool
++HttpHeader::setUrl(TSMBuffer const bufurl, TSMLoc const locurl)
++{
++  if (!isValid()) {
++    return false;
++  }
++
++  TSMLoc locurlout   = nullptr;
++  TSReturnCode rcode = TSHttpHdrUrlGet(m_buffer, m_lochdr, &locurlout);
++  if (TS_SUCCESS != rcode) {
++    return false;
++  }
++
++  // copy the url
++  rcode = TSUrlCopy(m_buffer, locurlout, bufurl, locurl);
++
++  // set url active
++  if (TS_SUCCESS == rcode) {
++    rcode = TSHttpHdrUrlSet(m_buffer, m_lochdr, locurlout);
++  }
++
++  TSHandleMLocRelease(m_buffer, m_lochdr, locurlout);
++
++  return TS_SUCCESS == rcode;
++}
++
++bool
++HttpHeader::setReason(char const *const valstr, int const vallen)
++{
++  if (isValid()) {
++    return TS_SUCCESS == TSHttpHdrReasonSet(m_buffer, m_lochdr, valstr, vallen);
++  } else {
++    return false;
++  }
++}
++
++char const *
++HttpHeader::getCharPtr(CharPtrGetFunc func, int *const len) const
++{
++  char const *res = nullptr;
++  if (isValid()) {
++    int reslen = 0;
++    res        = func(m_buffer, m_lochdr, &reslen);
++
++    if (nullptr != len) {
++      *len = reslen;
++    }
++  }
++
++  if (nullptr == res && nullptr != len) {
++    *len = 0;
++  }
++
++  return res;
++}
++
++bool
++HttpHeader::hasKey(char const *const key, int const keylen) const
++{
++  if (!isValid()) {
++    return false;
++  }
++
++  TSMLoc const locfield(TSMimeHdrFieldFind(m_buffer, m_lochdr, key, keylen));
++  if (nullptr != locfield) {
++    TSHandleMLocRelease(m_buffer, m_lochdr, locfield);
++    return true;
++  }
++
++  return false;
++}
++
++bool
++HttpHeader::removeKey(char const *const keystr, int const keylen)
++{
++  if (!isValid()) {
++    return false;
++  }
++
++  bool status = true;
++
++  TSMLoc const locfield = TSMimeHdrFieldFind(m_buffer, m_lochdr, keystr, keylen);
++  if (nullptr != locfield) {
++    int const rcode = TSMimeHdrFieldRemove(m_buffer, m_lochdr, locfield);
++    status          = (TS_SUCCESS == rcode);
++    TSHandleMLocRelease(m_buffer, m_lochdr, locfield);
++  }
++
++  return status;
++}
++
++bool
++HttpHeader::valueForKey(char const *const keystr, int const keylen, char *const valstr, int *const vallen, int const index) const
++{
++  if (!isValid()) {
++    *vallen = 0;
++    return false;
++  }
++
++  bool status = false;
++
++  TSMLoc const locfield = TSMimeHdrFieldFind(m_buffer, m_lochdr, keystr, keylen);
++
++  if (nullptr != locfield) {
++    int getlen               = 0;
++    char const *const getstr = TSMimeHdrFieldValueStringGet(m_buffer, m_lochdr, locfield, index, &getlen);
++
++    int const valcap = *vallen;
++    if (nullptr != getstr && 0 < getlen && getlen < (valcap - 1)) {
++      char *const endp = stpncpy(valstr, getstr, getlen);
++
++      *vallen = endp - valstr;
++      status  = (*vallen < valcap);
++
++      if (status) {
++        *endp = '\0';
++      }
++    }
++    TSHandleMLocRelease(m_buffer, m_lochdr, locfield);
++  } else {
++    *vallen = 0;
++  }
++
++  return status;
++}
++
++bool
++HttpHeader::setKeyVal(char const *const keystr, int const keylen, char const *const valstr, int const vallen, int const index)
++{
++  if (!isValid()) {
++    return false;
++  }
++
++  bool status(false);
++
++  TSMLoc locfield(TSMimeHdrFieldFind(m_buffer, m_lochdr, keystr, keylen));
++
++  if (nullptr != locfield) {
++    status = TS_SUCCESS == TSMimeHdrFieldValueStringSet(m_buffer, m_lochdr, locfield, index, valstr, vallen);
++  } else {
++    int rcode = TSMimeHdrFieldCreateNamed(m_buffer, m_lochdr, keystr, keylen, &locfield);
++
++    if (TS_SUCCESS == rcode) {
++      rcode = TSMimeHdrFieldValueStringSet(m_buffer, m_lochdr, locfield, index, valstr, vallen);
++      if (TS_SUCCESS == rcode) {
++        rcode  = TSMimeHdrFieldAppend(m_buffer, m_lochdr, locfield);
++        status = (TS_SUCCESS == rcode);
++      }
++    }
++  }
++
++  if (nullptr != locfield) {
++    TSHandleMLocRelease(m_buffer, m_lochdr, locfield);
++  }
++
++  return status;
++}
++
++std::string
++HttpHeader::toString() const
++{
++  std::string res;
++
++  if (!isValid()) {
++    return "<null>";
++  }
++
++  TSHttpType const htype(type());
++
++  switch (htype) {
++  case TS_HTTP_TYPE_REQUEST: {
++    res.append(method());
++
++    int urllen         = 0;
++    char *const urlstr = urlString(&urllen);
++    if (nullptr != urlstr) {
++      res.append(" ");
++      res.append(urlstr, urllen);
++      TSfree(urlstr);
++    } else {
++      res.append(" UnknownURL");
++    }
++
++    res.append(" HTTP/unparsed");
++  } break;
++
++  case TS_HTTP_TYPE_RESPONSE: {
++    char bufstr[1024];
++    /*
++    int const version = TSHttpHdrVersionGet(m_buffer, m_lochdr);
++    snprintf(bufstr, 1023, "%d ", version);
++    res.append(bufstr);
++    */
++    res.append("HTTP/unparsed");
++
++    int const status = TSHttpHdrStatusGet(m_buffer, m_lochdr);
++    snprintf(bufstr, 1023, " %d ", status);
++    res.append(bufstr);
++
++    int reasonlen             = 0;
++    char const *const hreason = reason(&reasonlen);
++
++    res.append(hreason, reasonlen);
++  } break;
++
++  default:
++  case TS_HTTP_TYPE_UNKNOWN:
++    res.append("UNKNOWN");
++    break;
++  }
++
++  res.append("\r\n");
++
++  int const numhdrs = TSMimeHdrFieldsCount(m_buffer, m_lochdr);
++
++  for (int indexhdr = 0; indexhdr < numhdrs; ++indexhdr) {
++    TSMLoc const locfield = TSMimeHdrFieldGet(m_buffer, m_lochdr, indexhdr);
++
++    int keylen               = 0;
++    char const *const keystr = TSMimeHdrFieldNameGet(m_buffer, m_lochdr, locfield, &keylen);
++
++    res.append(keystr, keylen);
++    res.append(": ");
++    int vallen               = 0;
++    char const *const valstr = TSMimeHdrFieldValueStringGet(m_buffer, m_lochdr, locfield, -1, &vallen);
++
++    res.append(valstr, vallen);
++    res.append("\r\n");
++
++    TSHandleMLocRelease(m_buffer, m_lochdr, locfield);
++  }
++
++  res.append("\r\n");
++
++  return res;
++}
++
++/////// HdrMgr
++
++TSParseResult
++HdrMgr::populateFrom(TSHttpParser const http_parser, TSIOBufferReader const reader, HeaderParseFunc const parsefunc)
++{
++  TSParseResult parse_res = TS_PARSE_CONT;
++
++  if (nullptr == m_buffer) {
++    m_buffer = TSMBufferCreate();
++  }
++  if (nullptr == m_lochdr) {
++    m_lochdr = TSHttpHdrCreate(m_buffer);
++  }
++
++  int64_t read_avail = TSIOBufferReaderAvail(reader);
++  if (0 < read_avail) {
++    TSIOBufferBlock block = TSIOBufferReaderStart(reader);
++    int64_t consumed      = 0;
++
++    parse_res = TS_PARSE_CONT;
++
++    while (nullptr != block && 0 < read_avail) {
++      int64_t blockbytes       = 0;
++      char const *const bstart = TSIOBufferBlockReadStart(block, reader, &blockbytes);
++
++      char const *ptr    = bstart;
++      char const *endptr = ptr + blockbytes;
++
++      parse_res = parsefunc(http_parser, m_buffer, m_lochdr, &ptr, endptr);
++
++      int64_t const bytes_parsed(ptr - bstart);
++
++      consumed += bytes_parsed;
++      read_avail -= bytes_parsed;
++
++      if (TS_PARSE_CONT == parse_res) {
++        block = TSIOBufferBlockNext(block);
++      } else {
++        break;
++      }
++    }
++    TSIOBufferReaderConsume(reader, consumed);
++  }
++
++  return parse_res;
++}
+diff --git a/plugins/experimental/slice/HttpHeader.h b/plugins/experimental/slice/HttpHeader.h
+new file mode 100644
+index 0000000..bfd9c4d
+--- /dev/null
++++ b/plugins/experimental/slice/HttpHeader.h
+@@ -0,0 +1,215 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++/**
++ An ATS Http header exists in a marshall buffer at a given location.
++ Unfortunately how that marshall buffer is created and how that
++ location is determined depends on where those buffers came from.
++
++ A TSHttpTxn manages the buffer itself and creates a location which
++ has to be managed.
++
++ A TSHttpParsed populates a created buffer that has had TSHttpHdrCreate
++ run against it which creates a location against it.  End users
++ need to manage the created buffer, the location and invoke
++ TSHttpHdrDestroy.
++*/
++
++#include "ts/ts.h"
++
++#include <string>
++
++static char const *const SLICER_MIME_FIELD_INFO = "X-Slicer-Info";
++
++/**
++  Designed to be a cheap throwaway struct which allows a
++  consumer to make various calls to manipulate headers.
++*/
++struct HttpHeader {
++  TSMBuffer const m_buffer;
++  TSMLoc const m_lochdr;
++
++  explicit HttpHeader(TSMBuffer buffer, TSMLoc lochdr) : m_buffer(buffer), m_lochdr(lochdr) {}
++  bool
++  isValid() const
++  {
++    return nullptr != m_buffer && nullptr != m_lochdr;
++  }
++
++  // TS_HTTP_TYPE_UNKNOWN, TS_HTTP_TYPE_REQUEST, TS_HTTP_TYPE_RESPONSE
++  TSHttpType type() const;
++
++  TSHttpStatus status() const;
++
++  bool setStatus(TSHttpStatus const newstatus);
++
++  bool setUrl(TSMBuffer const bufurl, TSMLoc const locurl);
++
++  typedef char const *(*CharPtrGetFunc)(TSMBuffer, TSMLoc, int *);
++
++  // request method TS_HTTP_METHOD_*
++  char const *
++  method(int *const len = nullptr) const
++  {
++    return getCharPtr(TSHttpHdrMethodGet, len);
++  }
++
++  // request method version
++  int
++  version() const
++  {
++    return TSHttpHdrVersionGet(m_buffer, m_lochdr);
++  }
++
++  // Returns string representation of the url. Caller gets ownership!
++  char *urlString(int *const urllen) const;
++
++  // host
++  char const *
++  hostname(int *const len) const
++  {
++    return getCharPtr(TSHttpHdrHostGet, len);
++  }
++
++  // response reason
++  char const *
++  reason(int *const len) const
++  {
++    return getCharPtr(TSHttpHdrReasonGet, len);
++  }
++
++  bool setReason(char const *const valstr, int const vallen);
++
++  bool hasKey(char const *const key, int const keylen) const;
++
++  // returns false if header invalid or something went wrong with removal.
++  bool removeKey(char const *const key, int const keylen);
++
++  bool valueForKey(char const *const keystr, int const keylen,
++                   char *const valstr,  // <-- return string value
++                   int *const vallen,   // <-- pass in capacity, returns len of string
++                   int const index = -1 // retrieves all values
++                   ) const;
++
++  /**
++    Sets or adds a key/value
++  */
++  bool setKeyVal(char const *const key, int const keylen, char const *const val, int const vallen,
++                 int const index = -1 // sets all values
++  );
++
++  /** dump header into provided char buffer
++   */
++  std::string toString() const;
++
++private:
++  /**
++    To be used with
++    TSHttpHdrMethodGet
++    TSHttpHdrHostGet
++    TSHttpHdrReasonGet
++   */
++  char const *getCharPtr(CharPtrGetFunc func, int *const len) const;
++};
++
++struct TxnHdrMgr {
++  TxnHdrMgr(TxnHdrMgr const &) = delete;
++  TxnHdrMgr &operator=(TxnHdrMgr const &) = delete;
++
++  TSMBuffer m_buffer{nullptr};
++  TSMLoc m_lochdr{nullptr};
++
++  TxnHdrMgr() : m_buffer(nullptr), m_lochdr(nullptr) {}
++  ~TxnHdrMgr()
++  {
++    if (nullptr != m_lochdr) {
++      TSHandleMLocRelease(m_buffer, TS_NULL_MLOC, m_lochdr);
++    }
++  }
++
++  typedef TSReturnCode (*HeaderGetFunc)(TSHttpTxn, TSMBuffer *, TSMLoc *);
++  /** use one of the following:
++    TSHttpTxnClientReqGet
++    TSHttpTxnClientRespGet
++    TSHttpTxnServerReqGet
++    TSHttpTxnServerRespGet
++    TSHttpTxnCachedReqGet
++    TSHttpTxnCachedRespGet
++  */
++
++  bool
++  populateFrom(TSHttpTxn const &txnp, HeaderGetFunc const &func)
++  {
++    return TS_SUCCESS == func(txnp, &m_buffer, &m_lochdr);
++  }
++
++  bool
++  isValid() const
++  {
++    return nullptr != m_lochdr;
++  }
++};
++
++struct HdrMgr {
++  HdrMgr(HdrMgr const &) = delete;
++  HdrMgr &operator=(HdrMgr const &) = delete;
++
++  TSMBuffer m_buffer{nullptr};
++  TSMLoc m_lochdr{nullptr};
++
++  HdrMgr() : m_buffer(nullptr), m_lochdr(nullptr) {}
++  ~HdrMgr()
++  {
++    if (nullptr != m_buffer) {
++      if (nullptr != m_lochdr) {
++        TSHttpHdrDestroy(m_buffer, m_lochdr);
++        TSHandleMLocRelease(m_buffer, TS_NULL_MLOC, m_lochdr);
++      }
++      TSMBufferDestroy(m_buffer);
++    }
++  }
++
++  void
++  resetHeader()
++  {
++    if (nullptr != m_buffer && nullptr != m_lochdr) {
++      TSHttpHdrDestroy(m_buffer, m_lochdr);
++      TSHandleMLocRelease(m_buffer, TS_NULL_MLOC, m_lochdr);
++      m_lochdr = nullptr;
++    }
++  }
++
++  typedef TSParseResult (*HeaderParseFunc)(TSHttpParser, TSMBuffer, TSMLoc, char const **, char const *);
++
++  /** Clear/create the parser before calling this and don't
++   use the parser on another header until done with this one.
++   use one of the following:
++     TSHttpHdrParseReq
++     TSHttpHdrParseResp
++    Call this multiple times if necessary.
++  */
++  TSParseResult populateFrom(TSHttpParser const http_parser, TSIOBufferReader const reader, HeaderParseFunc const parsefunc);
++
++  bool
++  isValid() const
++  {
++    return nullptr != m_lochdr;
++  }
++};
+diff --git a/plugins/experimental/slice/Makefile.inc b/plugins/experimental/slice/Makefile.inc
+new file mode 100644
+index 0000000..dbac02b
+--- /dev/null
++++ b/plugins/experimental/slice/Makefile.inc
+@@ -0,0 +1,63 @@
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++pkglib_LTLIBRARIES += experimental/slice/slice.la
++
++experimental_slice_slice_la_SOURCES = \
++  experimental/slice/client.cc \
++  experimental/slice/client.h \
++  experimental/slice/Config.cc \
++  experimental/slice/Config.h \
++  experimental/slice/ContentRange.cc \
++  experimental/slice/ContentRange.h \
++  experimental/slice/Data.cc \
++  experimental/slice/Data.h \
++  experimental/slice/HttpHeader.cc \
++  experimental/slice/HttpHeader.h \
++  experimental/slice/intercept.cc \
++  experimental/slice/intercept.h \
++  experimental/slice/Range.cc \
++  experimental/slice/Range.h \
++  experimental/slice/response.cc \
++  experimental/slice/response.h \
++  experimental/slice/server.cc \
++  experimental/slice/server.h \
++  experimental/slice/slice.cc \
++  experimental/slice/slice.h \
++  experimental/slice/Stage.h \
++  experimental/slice/transfer.cc \
++  experimental/slice/transfer.h
++
++check_PROGRAMS += experimental/slice/test_content_range
++
++experimental_slice_test_content_range_CPPFLAGS = $(AM_CPPFLAGS) -I$(abs_top_srcdir)/tests/include -DUNITTEST
++experimental_slice_test_content_range_SOURCES = \
++  experimental/slice/unit-tests/test_content_range.cc \
++  experimental/slice/ContentRange.cc
++
++check_PROGRAMS += experimental/slice/test_range
++
++experimental_slice_test_range_CPPFLAGS = $(AM_CPPFLAGS) -I$(abs_top_srcdir)/tests/include -DUNITTEST
++experimental_slice_test_range_SOURCES = \
++  experimental/slice/unit-tests/test_range.cc \
++  experimental/slice/Range.cc
++
++check_PROGRAMS += experimental/slice/test_config
++
++experimental_slice_test_config_CPPFLAGS = $(AM_CPPFLAGS) -I$(abs_top_srcdir)/tests/include -DUNITTEST
++experimental_slice_test_config_SOURCES = \
++  experimental/slice/unit-tests/test_config.cc \
++  experimental/slice/Config.cc
+diff --git a/plugins/experimental/slice/Makefile.tsxs b/plugins/experimental/slice/Makefile.tsxs
+new file mode 100644
+index 0000000..0992d8c
+--- /dev/null
++++ b/plugins/experimental/slice/Makefile.tsxs
+@@ -0,0 +1,66 @@
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++TSXS?=tsxs
++PLUGIN=slice
++
++all: $(PLUGIN).so
++
++SOURCES = \
++	Config.cc \
++	ContentRange.cc \
++	Data.cc \
++	HttpHeader.cc \
++	Range.cc \
++	client.cc \
++	intercept.cc \
++	response.cc \
++	server.cc \
++	slice.cc \
++	transfer.cc \
++
++HEADERS = \
++	Config.h \
++	ContentRange.h \
++	Data.h \
++	HttpHeader.h \
++	Range.h \
++	Stage.h \
++	client.h \
++	intercept.h \
++	response.h \
++	server.h \
++	slice.h \
++	transfer.h \
++
++$(PLUGIN).so: $(SOURCES) $(HEADERS)
++	$(TSXS) -v -o $(PLUGIN).so $(SOURCES)
++
++install: all
++	$(TSXS) -v -o $(PLUGIN).so -i
++
++TSINCLUDE = $(shell tsxs -q INCLUDEDIR)
++TSCXX = $(shell tsxs -q CXX)
++TSCXXFLAGS = $(shell tsxs -q CXXFLAGS)
++#PREFIX = $(shell tsxs -q PREFIX)
++#LIBS = -L$(PREFIX)/lib -latscppapi
++#LIBS = $(PREFIX)/lib/libtsutil.la
++
++slice_test: slice_test.cc ContentRange.cc Range.cc
++	$(TSCXX) -o $@ $^ $(TSCXXFLAGS) -I$(TSINCLUDE) -DUNITTEST
++
++clean: 
++	rm -fv *.lo *.so
+diff --git a/plugins/experimental/slice/README.md b/plugins/experimental/slice/README.md
+new file mode 100644
+index 0000000..ec3d1bc
+--- /dev/null
++++ b/plugins/experimental/slice/README.md
+@@ -0,0 +1,145 @@
++### Apache Traffic Server - Slicer Plugin
++
++The purpose of this plugin is to slice full file or range based requests
++into deterministic chunks.  This allows a large file to be spread across
++multiple cache stripes and allows range requests to be satisfied by
++stitching these chunks together.
++
++Deterministic chunks are requested from a parent cache or origin server
++using a preconfigured block byte size.
++
++The plugin is an example of an intercept handler which takes a single
++incoming request (range or whole asset), breaks it into a sequence
++of block requests and assembles those blocks into a client response.
++The plugin uses TSHttpConnect to delegate each block request to
++cache_range_requests.so which handles all cache and parent interaction.
++
++To enable the plugin, specify the plugin library via @plugin at the end
++of a remap line as follows (2MB slice in this example):
++
++```
++map http://ats-cache/ http://parent/ @plugin=slice.so @pparam=--blockbytes=2M @plugin=cache_range_requests.so
++```
++
++alternatively
++
++```
++map http://ats-cache/ http://parent/ @plugin=slice.so @pparam=-b @pparam=2M @plugin=cache_range_requests.so
++```
++
++for global plugins.
++
++```
++slice.so --blockbytes=2097152
++cache_range_requests.so
++```
++
++alternatively:
++
++```
++slice.so -b 2M
++cache_range_requests.so
++```
++
++Options for the slice plugin (typically last one wins):
++```
++--blockbytes=<number bytes> (optional)
++  Slice block size.
++	Default is 1m or 1048576 bytes.
++  also -b <num bytes>
++	Suffix k,m,g supported.
++	Limited to 32k and 32m inclusive.
++	For backwards compatibility blockbytes:<num bytes> is also supported.
++
++--test-blockbytes=<number bytes> (optional)
++  Slice block size for testing.
++  also -t <num bytes>
++	Suffix k,m,g supported.
++	Limited to any positive number.
++	Ignored if --blockbytes is provided.
++
++--pace-errorlog=<second(s)> (optional)
++  Limit stitching error logs to every 'n' second(s)
++  Default is to log all errors (no pacing).
++  also -p <seconds>
++
++--disable-errorlog (optional)
++  Disable writing stitching errors to the error log.
++  also -d
++```
++
++**Note**: cache_range_requests **MUST** follow slice.so Put these plugins
++at the end of the plugin list
++
++**Note**: blockbytes is defined in bytes. Postfix for 'K', 'M' and 'G'
++may be used.  1048576 (1MB) is the default.
++
++For testing purposes an unchecked value of "bytesover" is also available.
++
++Debug output can be enable by setting the debug tag: **slice**.  If debug
++is enabled all block stitch errors will log to diags.log
++
++The slice plugin is susceptible to block stitching errors caused by
++mismatched blocks.  For these cases special detailed error logs are
++provided to help with debugging.  Below is a sample error log entry::
++
++```
++[Apr 19 20:26:13.639] [ET_NET 17] ERROR: [slice] 1555705573.639 reason="Non 206 internal block response" uri="http://localhost:18080/%7Ep.tex/%7Es.50M/%7Eui.20000/" uas="curl/7.29.0" req_range="bytes=1000000-" norm_range="bytes 1000000-52428799/52428800" etag_exp="%221603934496%22" lm_exp="Fri, 19 Apr 2019 18:53:20 GMT" blk_range="21000000-21999999" status_got="400" cr_got="" etag_got="" lm_got="" cc="no-store" via=""
++```
++
++Current error types logged:
++```
++    Mismatch block Etag
++		Mismatch block Last-Modified
++		Non 206 internal block response
++		Mismatch/Bad block Content-Range
++```
++
++
++With slice error logs disabled these type errors can typically be detected
++by observing crc=ERR_READ_ERROR and pscl=0 in normal logs.
++
++At the current time only single range requests or the first part of a 
++multi part range request of the forms:
++```
++Range: bytes=<begin>-<end>
++Range: bytes=<begin>-
++Range: bytes=-<last N bytes>
++```
++are supported as multi part range responses are non trivial to implement.
++This matches with the cache_range_requests.so plugin capability.
++---
++
++Important things to note:
++
++Any first block server response that is not a 206 is passed down to
++the client.
++
++Only the first server response block is used to evaluate any "If-"
++headers.  Subsequent server slice block requests remove these headers.
++
++If a client aborts mid transaction the current slice block is completed
++to ensure that the block is written to cache.
++
++The only 416 case this plugin handles itself is if the requested range
++is inside the end slice block but past the content length.  Otherwise
++parents seem to properly issue 416 responses themselves.
++
++---
++
++To manually build the plugin use the "tsxs" executable that installs with
++traffic_server.
++
++Running the following command will build the plugin
++
++```
++tsxs -v -o slice.so *.cc
++```
++
++Running the following command will build and install the plugin.
++Beware this may crash a running system if the plugin is loaded
++and the OS uses memory paging with plugins.
++
++```
++tsxs -v -i -o slice.so *.cc
++```
+diff --git a/plugins/experimental/slice/Range.cc b/plugins/experimental/slice/Range.cc
+new file mode 100644
+index 0000000..c9a9d4d
+--- /dev/null
++++ b/plugins/experimental/slice/Range.cc
+@@ -0,0 +1,187 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "Range.h"
++#include "slice.h"
++
++#include <algorithm>
++#include <cinttypes>
++#include <cctype>
++#include <cstdio>
++#include <cstring>
++
++bool
++Range::isValid() const
++{
++  return m_beg < m_end && (0 <= m_beg || 0 == m_end);
++}
++
++int64_t
++Range::size() const
++{
++  return m_end - m_beg;
++}
++
++bool
++Range::fromStringClosed(char const *const rangestr)
++{
++  static char const *const BYTESTR = "bytes=";
++  static size_t const BYTESTRLEN   = strlen(BYTESTR);
++
++  m_beg = m_end = -1; // initialize invalid
++
++  // make sure this is in byte units
++  if (0 != strncmp(BYTESTR, rangestr, BYTESTRLEN)) {
++    return false;
++  }
++
++  // advance past any white space
++  char const *pstr = rangestr + BYTESTRLEN;
++  while ('\0' != *pstr && isblank(*pstr)) {
++    ++pstr;
++  }
++
++  // rip out any whitespace
++  char rangebuf[1024];
++  int const rangelen = sizeof(rangebuf);
++  char *pbuf         = rangebuf;
++  while ('\0' != *pstr && (pbuf - rangebuf) < rangelen) {
++    if (!isblank(*pstr)) {
++      *pbuf++ = *pstr;
++    }
++    ++pstr;
++  }
++  *pbuf = '\0';
++
++  int const rlen = (pbuf - rangebuf);
++
++  int consumed = 0;
++
++  // last 'n' bytes - result in range with negative begin and 0 end
++  int64_t endbytes         = 0;
++  char const *const fmtend = "-%" PRId64 "%n";
++  int const fieldsend      = sscanf(rangebuf, fmtend, &endbytes, &consumed);
++  if (1 == fieldsend) {
++    if (rlen == consumed) {
++      m_beg = -endbytes;
++      m_end = 0;
++      return true;
++    } else {
++      return false;
++    }
++  }
++
++  // normal range <front>-<back>
++  char const *const fmtclosed = "%" PRId64 "-%" PRId64 "%n";
++  int64_t front               = 0;
++  int64_t back                = 0;
++
++  int const fieldsclosed = sscanf(rangebuf, fmtclosed, &front, &back, &consumed);
++  if (2 == fieldsclosed) {
++    if (0 <= front && front <= back && rlen == consumed) {
++      m_beg = front;
++      m_end = back + 1;
++      return true;
++    } else {
++      return false;
++    }
++  }
++
++  front                    = 0;
++  char const *const fmtbeg = "%" PRId64 "-%n";
++  int const fieldsbeg      = sscanf(rangebuf, fmtbeg, &front, &consumed);
++  if (1 == fieldsbeg) {
++    if (rlen == consumed) {
++      m_beg = front;
++      m_end = Range::maxval;
++      return true;
++    } else {
++      return false;
++    }
++  }
++
++  return false;
++} // parseRange
++
++bool
++Range::toStringClosed(char *const bufstr,
++                      int *const buflen // returns actual bytes used
++                      ) const
++{
++  if (!isValid()) {
++    if (0 < *buflen) {
++      bufstr[0] = '\0';
++    }
++    *buflen = 0;
++    return false;
++  }
++
++  int const lenin = *buflen;
++
++  if (m_end <= Range::maxval) {
++    *buflen = snprintf(bufstr, lenin, "bytes=%" PRId64 "-%" PRId64, m_beg, m_end - 1);
++  } else {
++    *buflen = snprintf(bufstr, lenin, "bytes=%" PRId64 "-", m_beg);
++  }
++
++  return (0 < *buflen && *buflen < lenin);
++}
++
++int64_t
++Range::firstBlockFor(int64_t const blocksize) const
++{
++  if (0 < blocksize && isValid()) {
++    return std::max((int64_t)0, m_beg / blocksize);
++  } else {
++    return -1;
++  }
++}
++
++Range
++Range::intersectedWith(Range const &other) const
++{
++  return Range(std::max(m_beg, other.m_beg), std::min(m_end, other.m_end));
++}
++
++bool
++Range::blockIsInside(int64_t const blocksize, int64_t const blocknum) const
++{
++  Range const blockrange(blocksize * blocknum, blocksize * (blocknum + 1));
++
++  Range const isec(blockrange.intersectedWith(*this));
++
++  return isec.isValid();
++}
++
++int64_t
++Range::skipBytesForBlock(int64_t const blocksize, int64_t const blocknum) const
++{
++  int64_t const blockstart(blocksize * blocknum);
++
++  if (m_beg < blockstart) {
++    return 0;
++  } else {
++    return m_beg - blockstart;
++  }
++}
++
++bool
++Range::isEndBytes() const
++{
++  return m_beg < 0 && 0 == m_end;
++}
+diff --git a/plugins/experimental/slice/Range.h b/plugins/experimental/slice/Range.h
+new file mode 100644
+index 0000000..0fb3145
+--- /dev/null
++++ b/plugins/experimental/slice/Range.h
+@@ -0,0 +1,74 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "ts/ts.h"
++
++#include <limits>
++
++/**
++  represents a value parsed from a Range request header field.
++  Range is converted from a closed range into a half open.
++ */
++
++struct Range {
++public:
++  static int64_t constexpr maxval = (std::numeric_limits<int64_t>::max() >> 2);
++
++  int64_t m_beg = -1;
++  int64_t m_end = -1; // half open
++
++  Range() {}
++  explicit Range(int64_t const begin, int64_t const end) : m_beg(begin), m_end(end) {}
++
++  bool isValid() const;
++
++  int64_t size() const;
++
++  /** parse a from a closed request range into a half open range
++   * This will only correctly handle the *first* range that is
++   * parsed via TSMimeHdrFieldValueStringGet with index '0'.
++   * Range representing last N bytes will be coded as (-N, 0)
++   */
++  bool fromStringClosed(char const *const rangestr);
++
++  /** parse a from a closed request range into a half open range
++   */
++  bool toStringClosed(char *const rangestr, int *const rangelen) const;
++
++  /** block number of first range block
++   */
++  int64_t firstBlockFor(int64_t const blockbytes) const;
++
++  /** block intersection
++   */
++  Range intersectedWith(Range const &other) const;
++
++  /** is the given block inside held range?
++   */
++  bool blockIsInside(int64_t const blocksize, int64_t const blocknum) const;
++
++  /** number of skip bytes for the given block
++   */
++  int64_t skipBytesForBlock(int64_t const blocksize, int64_t const blocknum) const;
++
++  /** is this coded to indicate last N bytes?
++   */
++  bool isEndBytes() const;
++};
+diff --git a/plugins/experimental/slice/Stage.h b/plugins/experimental/slice/Stage.h
+new file mode 100644
+index 0000000..4166071
+--- /dev/null
++++ b/plugins/experimental/slice/Stage.h
+@@ -0,0 +1,149 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "ts/ts.h"
++
++struct Channel {
++  TSVIO m_vio{nullptr};
++  TSIOBuffer m_iobuf{nullptr};
++  TSIOBufferReader m_reader{nullptr};
++
++  ~Channel()
++  {
++    if (nullptr != m_reader) {
++      TSIOBufferReaderFree(m_reader);
++    }
++    if (nullptr != m_iobuf) {
++      TSIOBufferDestroy(m_iobuf);
++    }
++  }
++
++  void
++  drainReader()
++  {
++    TSAssert(nullptr != m_reader);
++    int64_t const bytes_avail = TSIOBufferReaderAvail(m_reader);
++    TSIOBufferReaderConsume(m_reader, bytes_avail);
++  }
++
++  bool
++  setForRead(TSVConn vc, TSCont contp, int64_t const bytesin //=INT64_MAX
++  )
++  {
++    TSAssert(nullptr != vc);
++    if (nullptr == m_iobuf) {
++      m_iobuf  = TSIOBufferCreate();
++      m_reader = TSIOBufferReaderAlloc(m_iobuf);
++    } else {
++      drainReader();
++    }
++    m_vio = TSVConnRead(vc, contp, m_iobuf, bytesin);
++    return nullptr != m_vio;
++  }
++
++  bool
++  setForWrite(TSVConn vc, TSCont contp, int64_t const bytesout //=INT64_MAX
++  )
++  {
++    TSAssert(nullptr != vc);
++    if (nullptr == m_iobuf) {
++      m_iobuf  = TSIOBufferCreate();
++      m_reader = TSIOBufferReaderAlloc(m_iobuf);
++    } else {
++      drainReader();
++    }
++    m_vio = TSVConnWrite(vc, contp, m_reader, bytesout);
++    return nullptr != m_vio;
++  }
++
++  void
++  close()
++  {
++    if (nullptr != m_reader) {
++      drainReader();
++    }
++    m_vio = nullptr;
++  }
++
++  bool
++  isOpen() const
++  {
++    return nullptr != m_iobuf && nullptr != m_reader && nullptr != m_vio;
++  }
++};
++
++struct Stage // upstream or downstream (server or client)
++{
++  Stage(Stage const &) = delete;
++  Stage &operator=(Stage const &) = delete;
++
++  TSVConn m_vc{nullptr};
++  Channel m_read;
++  Channel m_write;
++
++  Stage() {}
++  ~Stage()
++  {
++    if (nullptr != m_vc) {
++      TSVConnClose(m_vc);
++    }
++  }
++
++  void
++  setupConnection(TSVConn vc)
++  {
++    if (nullptr != m_vc) {
++      TSVConnClose(m_vc);
++    }
++    m_vc          = vc;
++    m_read.m_vio  = nullptr;
++    m_write.m_vio = nullptr;
++  }
++
++  void
++  setupVioRead(TSCont contp, int64_t const bytesin = INT64_MAX)
++  {
++    m_read.setForRead(m_vc, contp, bytesin);
++  }
++
++  void
++  setupVioWrite(TSCont contp, int64_t const bytesout = INT64_MAX)
++  {
++    m_write.setForWrite(m_vc, contp, bytesout);
++  }
++
++  void
++  close()
++  {
++    m_read.close();
++    m_write.close();
++
++    if (nullptr != m_vc) {
++      TSVConnClose(m_vc);
++      m_vc = nullptr;
++    }
++  }
++
++  bool
++  isOpen() const
++  {
++    return nullptr != m_vc && m_read.isOpen() && m_write.isOpen();
++  }
++};
+diff --git a/plugins/experimental/slice/client.cc b/plugins/experimental/slice/client.cc
+new file mode 100644
+index 0000000..7076f6d
+--- /dev/null
++++ b/plugins/experimental/slice/client.cc
+@@ -0,0 +1,232 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "client.h"
++
++#include "transfer.h"
++
++namespace
++{
++void
++shutdown(TSCont const contp, Data *const data)
++{
++  DEBUG_LOG("shutting down transaction");
++  delete data;
++  TSContDestroy(contp);
++}
++
++// create and issue a block request
++bool
++requestBlock(TSCont contp, Data *const data)
++{
++  int64_t const blockbeg = (data->m_config->m_blockbytes * data->m_blocknum);
++  Range blockbe(blockbeg, blockbeg + data->m_config->m_blockbytes);
++
++  char rangestr[1024];
++  int rangelen      = sizeof(rangestr);
++  bool const rpstat = blockbe.toStringClosed(rangestr, &rangelen);
++  TSAssert(rpstat);
++
++  DEBUG_LOG("requestBlock: %s", rangestr);
++
++  // reuse the incoming client header, just change the range
++  HttpHeader header(data->m_req_hdrmgr.m_buffer, data->m_req_hdrmgr.m_lochdr);
++
++  // add/set sub range key and add slicer tag
++  bool const rangestat = header.setKeyVal(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rangestr, rangelen);
++
++  if (!rangestat) {
++    ERROR_LOG("Error trying to set range request header %s", rangestr);
++    return false;
++  }
++
++  // create virtual connection back into ATS
++  TSVConn const upvc = TSHttpConnect((sockaddr *)&data->m_client_ip);
++
++  // set up connection with the HttpConnect server, maybe clear old one
++  data->m_upstream.setupConnection(upvc);
++  data->m_upstream.setupVioWrite(contp);
++
++  TSHttpHdrPrint(header.m_buffer, header.m_lochdr, data->m_upstream.m_write.m_iobuf);
++  TSVIOReenable(data->m_upstream.m_write.m_vio);
++
++  /*
++          std::string const headerstr(header.toString());
++          DEBUG_LOG("Headers\n%s", headerstr.c_str());
++  */
++
++  // get ready for data back from the server
++  data->m_upstream.setupVioRead(contp);
++
++  // anticipate the next server response header
++  TSHttpParserClear(data->m_http_parser);
++  data->m_resp_hdrmgr.resetHeader();
++
++  data->m_blockexpected              = 0;
++  data->m_blockconsumed              = 0;
++  data->m_iseos                      = false;
++  data->m_server_block_header_parsed = false;
++
++  return true;
++}
++
++} // namespace
++
++// this is called once per transaction when the client sends a req header
++bool
++handle_client_req(TSCont contp, TSEvent event, Data *const data)
++{
++  if (TS_EVENT_VCONN_READ_READY == event || TS_EVENT_VCONN_READ_COMPLETE == event) {
++    if (nullptr == data->m_http_parser) {
++      data->m_http_parser = TSHttpParserCreate();
++    }
++
++    // the client request header didn't fit into the input buffer:
++    if (TS_PARSE_DONE !=
++        data->m_req_hdrmgr.populateFrom(data->m_http_parser, data->m_dnstream.m_read.m_reader, TSHttpHdrParseReq)) {
++      return false;
++    }
++
++    // make the header manipulator
++    HttpHeader header(data->m_req_hdrmgr.m_buffer, data->m_req_hdrmgr.m_lochdr);
++
++    // set the request url back to pristine in case of plugin stacking
++    header.setUrl(data->m_urlbuffer, data->m_urlloc);
++
++    header.setKeyVal(TS_MIME_FIELD_HOST, TS_MIME_LEN_HOST, data->m_hostname, data->m_hostlen);
++
++    // default: whole file (unknown, wait for first server response)
++    Range rangebe;
++
++    char rangestr[1024];
++    int rangelen        = sizeof(rangestr);
++    bool const hasRange = header.valueForKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE, rangestr, &rangelen,
++                                             0); // <-- first range only
++    if (hasRange) {
++      // write parsed header into slicer meta tag
++      header.setKeyVal(SLICER_MIME_FIELD_INFO, strlen(SLICER_MIME_FIELD_INFO), rangestr, rangelen);
++      bool const isRangeGood = rangebe.fromStringClosed(rangestr);
++
++      if (isRangeGood) {
++        DEBUG_LOG("Partial content request");
++        data->m_statustype = TS_HTTP_STATUS_PARTIAL_CONTENT;
++      } else // signal a 416 needs to be formed and sent
++      {
++        DEBUG_LOG("Ill formed/unhandled range: %s", rangestr);
++        data->m_statustype = TS_HTTP_STATUS_REQUESTED_RANGE_NOT_SATISFIABLE;
++
++        // First block will give Content-Length
++        rangebe = Range(0, data->m_config->m_blockbytes);
++      }
++    } else {
++      DEBUG_LOG("Full content request");
++      static char const *const valstr = "-";
++      static size_t const vallen      = strlen(valstr);
++      header.setKeyVal(SLICER_MIME_FIELD_INFO, strlen(SLICER_MIME_FIELD_INFO), valstr, vallen);
++      data->m_statustype = TS_HTTP_STATUS_OK;
++      rangebe            = Range(0, Range::maxval);
++    }
++
++    // set to the first block in range
++    data->m_blocknum  = rangebe.firstBlockFor(data->m_config->m_blockbytes);
++    data->m_req_range = rangebe;
++
++    // remove ATS keys to avoid 404 loop
++    header.removeKey(TS_MIME_FIELD_VIA, TS_MIME_LEN_VIA);
++    header.removeKey(TS_MIME_FIELD_X_FORWARDED_FOR, TS_MIME_LEN_X_FORWARDED_FOR);
++
++    // send the first block request to server
++    if (!requestBlock(contp, data)) {
++      shutdown(contp, data);
++      return false;
++    }
++
++    // for subsequent blocks remove any conditionals which may fail
++    // an optimization would be to wait until the first block succeeds
++    header.removeKey(TS_MIME_FIELD_IF_MATCH, TS_MIME_LEN_IF_MATCH);
++    header.removeKey(TS_MIME_FIELD_IF_MODIFIED_SINCE, TS_MIME_LEN_IF_MODIFIED_SINCE);
++    header.removeKey(TS_MIME_FIELD_IF_NONE_MATCH, TS_MIME_LEN_IF_NONE_MATCH);
++    header.removeKey(TS_MIME_FIELD_IF_RANGE, TS_MIME_LEN_IF_RANGE);
++    header.removeKey(TS_MIME_FIELD_IF_UNMODIFIED_SINCE, TS_MIME_LEN_IF_UNMODIFIED_SINCE);
++  }
++
++  return true;
++}
++
++// this is when the client starts asking us for more data
++void
++handle_client_resp(TSCont contp, TSEvent event, Data *const data)
++{
++  if (TS_EVENT_VCONN_WRITE_READY == event || TS_EVENT_VCONN_WRITE_COMPLETE == event) {
++    transfer_content_bytes(data);
++
++    // done transferring from server to client buffer?
++    if (data->m_bytestosend <= data->m_bytessent) {
++      // real amount transferred to client
++      int64_t const bytessent(TSVIONDoneGet(data->m_dnstream.m_write.m_vio));
++
++      // is the output buffer drained?
++      if (data->m_bytestosend <= bytessent) {
++        data->m_dnstream.close();
++        if (!data->m_upstream.m_read.isOpen()) {
++          shutdown(contp, data);
++          return;
++        }
++      }
++
++      // continue allowing the downstream to drain
++      return;
++    }
++
++    // error condition from the server side
++    if (data->m_bail) {
++      shutdown(contp, data);
++      return;
++    }
++
++    // check for upstream eos, maybe request next block
++    if (data->m_iseos) {
++      // still need to drain the server side
++      if (0 < TSIOBufferReaderAvail(data->m_upstream.m_read.m_reader)) {
++        TSVIOReenable(data->m_dnstream.m_write.m_vio);
++        return;
++      }
++
++      // if done or partial block
++      if (data->m_blocknum < 0 || data->m_blockconsumed < data->m_blockexpected) {
++        shutdown(contp, data);
++        return;
++      }
++
++      // ready for next block
++      requestBlock(contp, data);
++    }
++  }
++  // client closed connection
++  else if (TS_EVENT_ERROR == event) {
++    DEBUG_LOG("got a TS_EVENT_ERROR from the client");
++
++    // allow the upstream server to drain
++    data->m_dnstream.close();
++    if (!data->m_upstream.m_read.isOpen()) {
++      shutdown(contp, data);
++    }
++  } else {
++    DEBUG_LOG("Unhandled event: %d", event);
++  }
++}
+diff --git a/plugins/experimental/slice/client.h b/plugins/experimental/slice/client.h
+new file mode 100644
+index 0000000..cc27bee
+--- /dev/null
++++ b/plugins/experimental/slice/client.h
+@@ -0,0 +1,34 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "Data.h"
++
++#include "ts/ts.h"
++
++/** Functions to deal with the connection to the client.
++ * Body content transfers are handled by the client.
++ * New block requests are also initiated by the client.
++ */
++
++/** returns true if the incoming vio can be turned off
++ */
++bool handle_client_req(TSCont contp, TSEvent event, Data *const data);
++
++void handle_client_resp(TSCont contp, TSEvent event, Data *const data);
+diff --git a/plugins/experimental/slice/intercept.cc b/plugins/experimental/slice/intercept.cc
+new file mode 100644
+index 0000000..f21306a
+--- /dev/null
++++ b/plugins/experimental/slice/intercept.cc
+@@ -0,0 +1,88 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "intercept.h"
++
++#include "Data.h"
++#include "client.h"
++#include "server.h"
++#include "slice.h"
++
++int
++intercept_hook(TSCont contp, TSEvent event, void *edata)
++{
++  // DEBUG_LOG("intercept_hook: %d", event);
++
++  Data *const data = static_cast<Data *>(TSContDataGet(contp));
++  if (nullptr == data) {
++    DEBUG_LOG("Events handled after data already torn down");
++    TSContDestroy(contp);
++    return TS_EVENT_ERROR;
++  }
++
++  // After the initial TS_EVENT_NET_ACCEPT
++  // any "events" will be handled by the vio read or write channel handler
++  switch (event) {
++  case TS_EVENT_NET_ACCEPT: {
++    // set up reader from client
++    TSVConn const downvc = (TSVConn)edata;
++    data->m_dnstream.setupConnection(downvc);
++    data->m_dnstream.setupVioRead(contp);
++  } break;
++
++  case TS_EVENT_VCONN_INACTIVITY_TIMEOUT:
++  case TS_EVENT_VCONN_ACTIVE_TIMEOUT:
++  case TS_EVENT_HTTP_TXN_CLOSE:
++    delete data;
++    TSContDestroy(contp);
++    break;
++
++  default: {
++    // data from client -- only the initial header
++    if (data->m_dnstream.m_read.isOpen() && edata == data->m_dnstream.m_read.m_vio) {
++      if (handle_client_req(contp, event, data)) {
++        // DEBUG_LOG("shutting down read from client pipe");
++        TSVConnShutdown(data->m_dnstream.m_vc, 1, 0);
++      }
++    }
++    // server wants more data from us, should never happen
++    // every time TSHttpConnect is called this resets
++    else if (data->m_upstream.m_write.isOpen() && edata == data->m_upstream.m_write.m_vio) {
++      // DEBUG_LOG("shutting down send to server pipe");
++      TSVConnShutdown(data->m_upstream.m_vc, 0, 1);
++    }
++    // server has data for us, typically handle just the header
++    else if (data->m_upstream.m_read.isOpen() && edata == data->m_upstream.m_read.m_vio) {
++      handle_server_resp(contp, event, data);
++    }
++    // client wants more data from us, only body content
++    else if (data->m_dnstream.m_write.isOpen() && edata == data->m_dnstream.m_write.m_vio) {
++      handle_client_resp(contp, event, data);
++    } else {
++      ERROR_LOG("Unhandled event: %d", event);
++      /*
++      std::cerr << __func__
++              << ": events received after intercept state torn down"
++              << std::endl;
++      */
++    }
++  }
++  }
++
++  return TS_EVENT_CONTINUE;
++}
+diff --git a/plugins/experimental/slice/intercept.h b/plugins/experimental/slice/intercept.h
+new file mode 100644
+index 0000000..3b59cef
+--- /dev/null
++++ b/plugins/experimental/slice/intercept.h
+@@ -0,0 +1,23 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "ts/ts.h"
++
++int intercept_hook(TSCont contp, TSEvent event, void *edata);
+diff --git a/plugins/experimental/slice/response.cc b/plugins/experimental/slice/response.cc
+new file mode 100644
+index 0000000..410b150
+--- /dev/null
++++ b/plugins/experimental/slice/response.cc
+@@ -0,0 +1,107 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "response.h"
++
++#include <cinttypes>
++#include <cstring>
++#include <mutex>
++
++#include "ts/ts.h"
++
++// canned body string for a 416, stolen from nginx
++std::string const &
++bodyString416()
++{
++  static std::string bodystr;
++  static std::mutex mutex;
++  std::lock_guard<std::mutex> const guard(mutex);
++
++  if (bodystr.empty()) {
++    bodystr.append("<html>\n");
++    bodystr.append("<head><title>416 Requested Range Not Satisfiable</title></head>\n");
++    bodystr.append("<body bgcolor=\"white\">\n");
++    bodystr.append("<center><h1>416 Requested Range Not Satisfiable</h1></center>");
++    bodystr.append("<hr><center>ATS/");
++    bodystr.append(TS_VERSION_STRING);
++    bodystr.append("</center>\n");
++    bodystr.append("</body>\n");
++    bodystr.append("</html>\n");
++  }
++
++  return bodystr;
++}
++
++// Form a 502 response, preliminary
++std::string const &
++string502()
++{
++  static std::string msg;
++  static std::mutex mutex;
++  std::lock_guard<std::mutex> const guard(mutex);
++
++  if (msg.empty()) {
++    std::string bodystr;
++    bodystr.append("<html>\n");
++    bodystr.append("<head><title>502 Bad Gateway</title></head>\n");
++    bodystr.append("<body bgcolor=\"white\">\n");
++    bodystr.append("<center><h1>502 Bad Gateway: Missing/Malformed "
++                   "Content-Range</h1></center>");
++    bodystr.append("<hr><center>ATS/");
++    bodystr.append(TS_VERSION_STRING);
++    bodystr.append("</center>\n");
++    bodystr.append("</body>\n");
++    bodystr.append("</html>\n");
++
++    char clenstr[1024];
++    int const clen = snprintf(clenstr, sizeof(clenstr), "%lu", bodystr.size());
++
++    msg.append("HTTP/1.1 502 Bad Gateway\r\n");
++    msg.append("Content-Length: ");
++    msg.append(clenstr, clen);
++    msg.append("\r\n");
++
++    msg.append("\r\n");
++    msg.append(bodystr);
++  }
++
++  return msg;
++}
++
++void
++form416HeaderAndBody(HttpHeader &header, int64_t const contentlen, std::string const &bodystr)
++{
++  header.removeKey(TS_MIME_FIELD_LAST_MODIFIED, TS_MIME_LEN_LAST_MODIFIED);
++  header.removeKey(TS_MIME_FIELD_ETAG, TS_MIME_LEN_ETAG);
++  header.removeKey(TS_MIME_FIELD_ACCEPT_RANGES, TS_MIME_LEN_ACCEPT_RANGES);
++
++  header.setStatus(TS_HTTP_STATUS_REQUESTED_RANGE_NOT_SATISFIABLE);
++  char const *const reason = TSHttpHdrReasonLookup(TS_HTTP_STATUS_REQUESTED_RANGE_NOT_SATISFIABLE);
++  header.setReason(reason, strlen(reason));
++
++  char bufstr[256];
++  int buflen = snprintf(bufstr, sizeof(bufstr), "%lu", bodystr.size());
++  header.setKeyVal(TS_MIME_FIELD_CONTENT_LENGTH, TS_MIME_LEN_CONTENT_LENGTH, bufstr, buflen);
++
++  static char const *const ctypestr = "text/html";
++  static int const ctypelen         = strlen(ctypestr);
++  header.setKeyVal(TS_MIME_FIELD_CONTENT_TYPE, TS_MIME_LEN_CONTENT_TYPE, ctypestr, ctypelen);
++
++  buflen = snprintf(bufstr, 255, "*/%" PRId64, contentlen);
++  header.setKeyVal(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE, bufstr, buflen);
++}
+diff --git a/plugins/experimental/slice/response.h b/plugins/experimental/slice/response.h
+new file mode 100644
+index 0000000..925db65
+--- /dev/null
++++ b/plugins/experimental/slice/response.h
+@@ -0,0 +1,28 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "HttpHeader.h"
++#include <string>
++
++std::string const &string502();
++
++std::string const &bodyString416();
++
++void form416HeaderAndBody(HttpHeader &header, int64_t const contentlen, std::string const &bodystr);
+diff --git a/plugins/experimental/slice/server.cc b/plugins/experimental/slice/server.cc
+new file mode 100644
+index 0000000..5d94417
+--- /dev/null
++++ b/plugins/experimental/slice/server.cc
+@@ -0,0 +1,450 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "server.h"
++
++#include "ContentRange.h"
++#include "response.h"
++#include "transfer.h"
++
++#include "ts/experimental.h"
++
++#include <cinttypes>
++
++namespace
++{
++void
++shutdown(TSCont const contp, Data *const data)
++{
++  DEBUG_LOG("shutting down transaction");
++  delete data;
++  TSContDestroy(contp);
++}
++
++ContentRange
++contentRangeFrom(HttpHeader const &header)
++{
++  ContentRange bcr;
++
++  /* Pull content length off the response header
++    and manipulate it into a client response header
++   */
++  char rangestr[1024];
++  int rangelen = sizeof(rangestr);
++
++  // look for expected Content-Range field
++  bool const hasContentRange(header.valueForKey(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE, rangestr, &rangelen));
++
++  if (!hasContentRange) {
++    DEBUG_LOG("invalid response header, no Content-Range");
++  } else if (!bcr.fromStringClosed(rangestr)) {
++    DEBUG_LOG("invalid response header, malformed Content-Range, %s", rangestr);
++  }
++
++  return bcr;
++}
++
++bool
++handleFirstServerHeader(Data *const data, TSCont const contp)
++{
++  HttpHeader header(data->m_resp_hdrmgr.m_buffer, data->m_resp_hdrmgr.m_lochdr);
++
++  //  DEBUG_LOG("First header\n%s", header.toString().c_str());
++
++  data->m_dnstream.setupVioWrite(contp);
++
++  // only process a 206, everything else gets a pass through
++  if (TS_HTTP_STATUS_PARTIAL_CONTENT != header.status()) {
++    DEBUG_LOG("Initial response other than 206: %d", header.status());
++    data->m_bail = true;
++
++    TSHttpHdrPrint(header.m_buffer, header.m_lochdr, data->m_dnstream.m_write.m_iobuf);
++
++    transfer_all_bytes(data);
++
++    return false;
++  }
++
++  ContentRange const blockcr = contentRangeFrom(header);
++  // 206 with bad content range?
++  if (!blockcr.isValid()) {
++    data->m_bail = true;
++
++    static std::string const &msg502 = string502();
++
++    TSIOBufferWrite(data->m_dnstream.m_write.m_iobuf, msg502.data(), msg502.size());
++    TSVIOReenable(data->m_dnstream.m_write.m_vio);
++
++    return false;
++  }
++
++  // set the resource content length from block response
++  data->m_contentlen = blockcr.m_length;
++
++  // special case last N bytes
++  if (data->m_req_range.isEndBytes()) {
++    data->m_req_range.m_end += data->m_contentlen;
++    data->m_req_range.m_beg += data->m_contentlen;
++    data->m_req_range.m_beg = std::max((int64_t)0, data->m_req_range.m_beg);
++  } else {
++    // fix up request range end now that we have the content length
++    data->m_req_range.m_end = std::min(data->m_contentlen, data->m_req_range.m_end);
++  }
++
++  int64_t const bodybytes = data->m_req_range.size();
++
++  // range past end of data, assume 416 needs to be sent
++  bool const send416 = (bodybytes <= 0 || TS_HTTP_STATUS_REQUESTED_RANGE_NOT_SATISFIABLE == data->m_statustype);
++  if (send416) {
++    data->m_bail               = true;
++    std::string const &bodystr = bodyString416();
++    form416HeaderAndBody(header, data->m_contentlen, bodystr);
++
++    TSHttpHdrPrint(header.m_buffer, header.m_lochdr, data->m_dnstream.m_write.m_iobuf);
++
++    TSIOBufferWrite(data->m_dnstream.m_write.m_iobuf, bodystr.data(), bodystr.size());
++
++    TSVIOReenable(data->m_dnstream.m_write.m_vio);
++
++    return false;
++  }
++
++  // save weak cache header identifiers (rfc7232 section 2)
++  data->m_etaglen = sizeof(data->m_etag) - 1;
++  header.valueForKey(TS_MIME_FIELD_ETAG, TS_MIME_LEN_ETAG, data->m_etag, &data->m_etaglen);
++  data->m_lastmodifiedlen = sizeof(data->m_lastmodified) - 1;
++  header.valueForKey(TS_MIME_FIELD_LAST_MODIFIED, TS_MIME_LEN_LAST_MODIFIED, data->m_lastmodified, &data->m_lastmodifiedlen);
++
++  // size of the first block payload
++  data->m_blockexpected = blockcr.rangeSize();
++
++  // Now we can set up the expected client response
++  if (TS_HTTP_STATUS_PARTIAL_CONTENT == data->m_statustype) {
++    ContentRange respcr;
++    respcr.m_beg    = data->m_req_range.m_beg;
++    respcr.m_end    = data->m_req_range.m_end;
++    respcr.m_length = data->m_contentlen;
++
++    char rangestr[1024];
++    int rangelen      = sizeof(rangestr);
++    bool const crstat = respcr.toStringClosed(rangestr, &rangelen);
++
++    // corner case, return 500 ??
++    if (!crstat) {
++      data->m_bail = true;
++
++      data->m_upstream.close();
++      data->m_dnstream.close();
++
++      ERROR_LOG("Bad/invalid response content range");
++      return false;
++    }
++
++    header.setKeyVal(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE, rangestr, rangelen);
++  }
++  // fix up for 200 response
++  else if (TS_HTTP_STATUS_OK == data->m_statustype) {
++    header.setStatus(TS_HTTP_STATUS_OK);
++    static char const *const reason = TSHttpHdrReasonLookup(TS_HTTP_STATUS_OK);
++    header.setReason(reason, strlen(reason));
++    header.removeKey(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE);
++  }
++
++  char bufstr[1024];
++  int const buflen = snprintf(bufstr, sizeof(bufstr), "%" PRId64, bodybytes);
++  header.setKeyVal(TS_MIME_FIELD_CONTENT_LENGTH, TS_MIME_LEN_CONTENT_LENGTH, bufstr, buflen);
++
++  // add the response header length to the total bytes to send
++  int64_t const headerbytes = TSHttpHdrLengthGet(header.m_buffer, header.m_lochdr);
++
++  data->m_bytestosend = headerbytes + bodybytes;
++
++  TSHttpHdrPrint(header.m_buffer, header.m_lochdr, data->m_dnstream.m_write.m_iobuf);
++
++  data->m_bytessent = headerbytes;
++
++  TSVIOReenable(data->m_dnstream.m_write.m_vio);
++
++  return true;
++}
++
++void
++logSliceError(char const *const message, Data const *const data, HttpHeader const &header_resp)
++{
++  Config *const config = data->m_config;
++
++  bool const logToError = config->canLogError();
++
++  // always write block stitch errors while in debug mode
++  if (!logToError && !TSIsDebugTagSet(PLUGIN_NAME)) {
++    return;
++  }
++
++  HttpHeader const header_req(data->m_req_hdrmgr.m_buffer, data->m_req_hdrmgr.m_lochdr);
++
++  TSHRTime const timenowus = TShrtime();
++  int64_t const msecs      = timenowus / 1000000;
++  int64_t const secs       = msecs / 1000;
++  int64_t const ms         = msecs % 1000;
++
++  // Gather information on the request, must delete urlstr
++  int urllen         = 0;
++  char *const urlstr = header_req.urlString(&urllen);
++
++  char urlpstr[16384];
++  size_t urlplen = sizeof(urlpstr);
++  TSStringPercentEncode(urlstr, urllen, urlpstr, urlplen, &urlplen, nullptr);
++
++  if (nullptr != urlstr) {
++    TSfree(urlstr);
++  }
++
++  // uas
++  char uasstr[8192];
++  int uaslen = sizeof(uasstr);
++  header_req.valueForKey(TS_MIME_FIELD_USER_AGENT, TS_MIME_LEN_USER_AGENT, uasstr, &uaslen);
++
++  // raw range request
++  char rangestr[1024];
++  int rangelen = sizeof(rangestr);
++  header_req.valueForKey(SLICER_MIME_FIELD_INFO, strlen(SLICER_MIME_FIELD_INFO), rangestr, &rangelen);
++
++  // Normalized range request
++  ContentRange const crange(data->m_req_range.m_beg, data->m_req_range.m_end, data->m_contentlen);
++  char normstr[1024];
++  int normlen = sizeof(normstr);
++  crange.toStringClosed(normstr, &normlen);
++
++  // block range request
++  int64_t const blockbeg = data->m_blocknum * data->m_config->m_blockbytes;
++  int64_t const blockend = std::min(blockbeg + data->m_config->m_blockbytes, data->m_contentlen);
++
++  // Block response data
++  TSHttpStatus const statusgot = header_resp.status();
++
++  // content range
++  char crstr[1024];
++  int crlen = sizeof(crstr);
++  header_resp.valueForKey(TS_MIME_FIELD_CONTENT_RANGE, TS_MIME_LEN_CONTENT_RANGE, crstr, &crlen);
++
++  // etag
++  char etagstr[1024];
++  int etaglen = sizeof(etagstr);
++  header_resp.valueForKey(TS_MIME_FIELD_ETAG, TS_MIME_LEN_ETAG, etagstr, &etaglen);
++
++  // last modified
++  char lmstr[1024];
++  int lmlen = sizeof(lmstr);
++  header_resp.valueForKey(TS_MIME_FIELD_LAST_MODIFIED, TS_MIME_LEN_LAST_MODIFIED, lmstr, &lmlen);
++
++  // cc
++  char ccstr[2048];
++  int cclen = sizeof(ccstr);
++  header_resp.valueForKey(TS_MIME_FIELD_CACHE_CONTROL, TS_MIME_LEN_CACHE_CONTROL, ccstr, &cclen);
++
++  // via tag
++  char viastr[8192];
++  int vialen = sizeof(viastr);
++  header_resp.valueForKey(TS_MIME_FIELD_VIA, TS_MIME_LEN_VIA, viastr, &vialen);
++
++  char etagexpstr[1024];
++  size_t etagexplen = sizeof(etagexpstr);
++  TSStringPercentEncode(data->m_etag, data->m_etaglen, etagexpstr, etagexplen, &etagexplen, nullptr);
++
++  char etaggotstr[1024];
++  size_t etaggotlen = sizeof(etaggotstr);
++  TSStringPercentEncode(etagstr, etaglen, etaggotstr, etaggotlen, &etaggotlen, nullptr);
++
++  DEBUG_LOG("Logging Block Stitch error");
++
++  ERROR_LOG("%" PRId64 ".%" PRId64 " reason=\"%s\""
++            " uri=\"%.*s\""
++            " uas=\"%.*s\""
++            " req_range=\"%.*s\""
++            " norm_range=\"%.*s\""
++
++            " etag_exp=\"%.*s\""
++            " lm_exp=\"%.*s\""
++
++            " blk_range=\"%" PRId64 "-%" PRId64 "\""
++
++            " status_got=\"%d\""
++            " cr_got=\"%.*s\""
++            " etag_got=\"%.*s\""
++            " lm_got=\"%.*s\""
++            " cc=\"%.*s\""
++            " via=\"%.*s\"",
++            secs, ms, message, (int)urlplen, urlpstr, uaslen, uasstr, rangelen, rangestr, normlen, normstr, (int)etagexplen,
++            etagexpstr, data->m_lastmodifiedlen, data->m_lastmodified, blockbeg, blockend - 1, statusgot, crlen, crstr,
++            (int)etaggotlen, etaggotstr, lmlen, lmstr, cclen, ccstr, vialen, viastr);
++}
++
++bool
++handleNextServerHeader(Data *const data, TSCont const contp)
++{
++  // block response header
++  HttpHeader header(data->m_resp_hdrmgr.m_buffer, data->m_resp_hdrmgr.m_lochdr);
++  //  DEBUG_LOG("Next Header:\n%s", header.toString().c_str());
++
++  // only process a 206, everything else just aborts
++  if (TS_HTTP_STATUS_PARTIAL_CONTENT != header.status()) {
++    logSliceError("Non 206 internal block response", data, header);
++    data->m_bail = true;
++    return false;
++  }
++
++  // can't parse the content range header, abort -- might be too strict
++  ContentRange const blockcr = contentRangeFrom(header);
++  if (!blockcr.isValid() || blockcr.m_length != data->m_contentlen) {
++    logSliceError("Mismatch/Bad block Content-Range", data, header);
++    data->m_bail = true;
++    return false;
++  }
++
++  bool same = true;
++
++  // prefer the etag but use Last-Modified if we must.
++  char etag[8192];
++  int etaglen = sizeof(etag);
++  header.valueForKey(TS_MIME_FIELD_ETAG, TS_MIME_LEN_ETAG, etag, &etaglen);
++
++  if (0 < data->m_etaglen || 0 < etaglen) {
++    same = data->m_etaglen == etaglen && 0 == strncmp(etag, data->m_etag, etaglen);
++    if (!same) {
++      logSliceError("Mismatch block Etag", data, header);
++    }
++  } else {
++    char lastmodified[8192];
++    int lastmodifiedlen = sizeof(lastmodified);
++    header.valueForKey(TS_MIME_FIELD_LAST_MODIFIED, TS_MIME_LEN_LAST_MODIFIED, lastmodified, &lastmodifiedlen);
++    if (0 < data->m_lastmodifiedlen || 0 != lastmodifiedlen) {
++      same = data->m_lastmodifiedlen == lastmodifiedlen && 0 == strncmp(lastmodified, data->m_lastmodified, lastmodifiedlen);
++      if (!same) {
++        logSliceError("Mismatch block Last-Modified", data, header);
++      }
++    }
++  }
++
++  if (!same) {
++    data->m_bail = true;
++    return false;
++  }
++
++  data->m_blockexpected = blockcr.rangeSize();
++
++  return true;
++}
++
++} // namespace
++
++// this is called every time the server has data for us
++void
++handle_server_resp(TSCont contp, TSEvent event, Data *const data)
++{
++  if (TS_EVENT_VCONN_READ_READY == event || TS_EVENT_VCONN_READ_COMPLETE == event) {
++    // has block response header been parsed??
++    if (!data->m_server_block_header_parsed) {
++      // the server response header didn't fit into the input buffer??
++      if (TS_PARSE_DONE !=
++          data->m_resp_hdrmgr.populateFrom(data->m_http_parser, data->m_upstream.m_read.m_reader, TSHttpHdrParseResp)) {
++        return;
++      }
++
++      // very first server response header
++      bool headerStat = false;
++      if (!data->m_server_first_header_parsed) {
++        headerStat                         = handleFirstServerHeader(data, contp);
++        data->m_server_first_header_parsed = true;
++      } else {
++        headerStat = handleNextServerHeader(data, contp);
++      }
++
++      data->m_server_block_header_parsed = true;
++
++      // kill the upstream and allow dnstream to clean up
++      if (!headerStat) {
++        data->m_upstream.close();
++        data->m_bail = true;
++        if (data->m_dnstream.m_write.isOpen()) {
++          TSVIOReenable(data->m_dnstream.m_write.m_vio);
++        } else {
++          shutdown(contp, data);
++        }
++        return;
++      }
++
++      // how much to fast forward into this data block
++      data->m_blockskip = data->m_req_range.skipBytesForBlock(data->m_config->m_blockbytes, data->m_blocknum);
++    }
++
++    transfer_content_bytes(data);
++  } else if (TS_EVENT_VCONN_EOS == event) {
++    // from testing as far as I can tell, if the sub transaction returns
++    // a valid header TS_EVENT_VCONN_READ_READY event is always called first.
++    // this event being called means the input stream is null.
++    // An upstream transaction that aborts immediately (or a few bytes)
++    // after it sends a header may end up here with nothing in the upstream
++    // buffer.
++
++    // this is called when the upstream connection is done.
++    // make sure to drain all the bytes out before
++    // issuing the next block request
++    data->m_iseos = true;
++
++    // corner condition, good source header + 0 length aborted content
++    // results in no header being read, just an EOS.
++    // trying to delete the upstream will crash ATS (??)
++    if (0 == data->m_blockexpected) {
++      shutdown(contp, data); // this will crash if first block
++      return;
++    }
++
++    transfer_content_bytes(data);
++
++    if (!data->m_dnstream.m_write.isOpen()) // server drain condition
++    {
++      shutdown(contp, data);
++      return;
++    }
++
++    // all bytes left transferred to client buffer
++    if (0 == TSIOBufferReaderAvail(data->m_upstream.m_read.m_reader)) {
++      data->m_upstream.close();
++      TSVIOReenable(data->m_dnstream.m_write.m_vio);
++    }
++
++    // prepare for the next request block
++    ++data->m_blocknum;
++
++    // when we get a "bytes=-<end>" last N bytes request the plugin
++    // issues a speculative request for the first block
++    // in that case fast forward to the real first in range block
++    // Btw this isn't implemented yet, to be handled
++    int64_t const firstblock(data->m_req_range.firstBlockFor(data->m_config->m_blockbytes));
++    if (data->m_blocknum < firstblock) {
++      data->m_blocknum = firstblock;
++    }
++
++    // done processing blocks?
++    if (!data->m_req_range.blockIsInside(data->m_config->m_blockbytes, data->m_blocknum)) {
++      data->m_blocknum = -1; // signal value no more blocks
++    }
++  } else {
++    DEBUG_LOG("Unhandled event: %d", event);
++  }
++}
+diff --git a/plugins/experimental/slice/server.h b/plugins/experimental/slice/server.h
+new file mode 100644
+index 0000000..c0d77e4
+--- /dev/null
++++ b/plugins/experimental/slice/server.h
+@@ -0,0 +1,37 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "Data.h"
++
++#include "ts/ts.h"
++
++/** Functions to handle the connection to the server.
++ * In particular slice block header responses are handled here.
++ * Data transfers are handled by the client code which pulls
++ * the data from the server side.
++ *
++ * Special case is when the client connection has been closed
++ * because of client data request being fulfilled or
++ * when the client aborts.  The current slice block will
++ * continue reading to ensure the whole block is transferred
++ * to cache.
++ */
++
++void handle_server_resp(TSCont contp, TSEvent event, Data *const data);
+diff --git a/plugins/experimental/slice/slice.cc b/plugins/experimental/slice/slice.cc
+new file mode 100644
+index 0000000..5b5c90b
+--- /dev/null
++++ b/plugins/experimental/slice/slice.cc
+@@ -0,0 +1,206 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "slice.h"
++
++#include "Config.h"
++#include "Data.h"
++#include "HttpHeader.h"
++#include "intercept.h"
++
++#include "ts/remap.h"
++#include "ts/ts.h"
++
++#include <netinet/in.h>
++
++namespace
++{
++Config globalConfig;
++
++bool
++read_request(TSHttpTxn txnp, Config *const config)
++{
++  DEBUG_LOG("slice read_request");
++  TxnHdrMgr hdrmgr;
++  hdrmgr.populateFrom(txnp, TSHttpTxnClientReqGet);
++  HttpHeader const header(hdrmgr.m_buffer, hdrmgr.m_lochdr);
++
++  if (TS_HTTP_METHOD_GET == header.method()) {
++    static int const SLICER_MIME_LEN_INFO = strlen(SLICER_MIME_FIELD_INFO);
++    if (!header.hasKey(SLICER_MIME_FIELD_INFO, SLICER_MIME_LEN_INFO)) {
++      // turn off any and all transaction caching (shouldn't matter)
++      TSHttpTxnServerRespNoStoreSet(txnp, 1);
++      TSHttpTxnRespCacheableSet(txnp, 0);
++      TSHttpTxnReqCacheableSet(txnp, 0);
++
++      DEBUG_LOG("slice accepting and slicing");
++      // connection back into ATS
++      sockaddr const *const ip = TSHttpTxnClientAddrGet(txnp);
++      if (nullptr == ip) {
++        return false;
++      }
++
++      TSAssert(nullptr != config);
++      Data *const data = new Data(config);
++
++      // set up feedback connect
++      if (AF_INET == ip->sa_family) {
++        memcpy(&data->m_client_ip, ip, sizeof(sockaddr_in));
++      } else if (AF_INET6 == ip->sa_family) {
++        memcpy(&data->m_client_ip, ip, sizeof(sockaddr_in6));
++      } else {
++        delete data;
++        return false;
++      }
++
++      // need to reset the HOST field for global plugin
++      data->m_hostlen = sizeof(data->m_hostname) - 1;
++      if (!header.valueForKey(TS_MIME_FIELD_HOST, TS_MIME_LEN_HOST, data->m_hostname, &data->m_hostlen)) {
++        DEBUG_LOG("Unable to get hostname from header");
++        delete data;
++        return false;
++      }
++
++      // need the pristine url, especially for global plugins
++      TSMBuffer urlbuf;
++      TSMLoc urlloc;
++      TSReturnCode rcode = TSHttpTxnPristineUrlGet(txnp, &urlbuf, &urlloc);
++
++      if (TS_SUCCESS == rcode) {
++        TSMBuffer const newbuf = TSMBufferCreate();
++        TSMLoc newloc          = nullptr;
++        rcode                  = TSUrlClone(newbuf, urlbuf, urlloc, &newloc);
++        TSHandleMLocRelease(urlbuf, TS_NULL_MLOC, urlloc);
++
++        if (TS_SUCCESS != rcode) {
++          ERROR_LOG("Error cloning pristine url");
++          delete data;
++          TSMBufferDestroy(newbuf);
++          return false;
++        }
++
++        data->m_urlbuffer = newbuf;
++        data->m_urlloc    = newloc;
++      }
++
++      // we'll intercept this GET and do it ourselves
++      TSCont const icontp(TSContCreate(intercept_hook, TSMutexCreate()));
++      TSContDataSet(icontp, (void *)data);
++      //      TSHttpTxnHookAdd(txnp, TS_HTTP_TXN_CLOSE_HOOK, icontp);
++      TSHttpTxnIntercept(icontp, txnp);
++      return true;
++    } else {
++      DEBUG_LOG("slice passing GET request through to next plugin");
++    }
++  }
++
++  return false;
++}
++
++int
++global_read_request_hook(TSCont // contp
++                         ,
++                         TSEvent // event
++                         ,
++                         void *edata)
++{
++  TSHttpTxn const txnp = static_cast<TSHttpTxn>(edata);
++  read_request(txnp, &globalConfig);
++  TSHttpTxnReenable(txnp, TS_EVENT_HTTP_CONTINUE);
++  return 0;
++}
++
++} // namespace
++
++///// remap plugin engine
++
++SLICE_EXPORT
++TSRemapStatus
++TSRemapDoRemap(void *ih, TSHttpTxn txnp, TSRemapRequestInfo *rri)
++{
++  Config *const config = static_cast<Config *>(ih);
++
++  if (read_request(txnp, config)) {
++    return TSREMAP_DID_REMAP_STOP;
++  } else {
++    return TSREMAP_NO_REMAP;
++  }
++}
++
++///// remap plugin setup and teardown
++SLICE_EXPORT
++void
++TSRemapOSResponse(void *ih, TSHttpTxn rh, int os_response_type)
++{
++}
++
++SLICE_EXPORT
++TSReturnCode
++TSRemapNewInstance(int argc, char *argv[], void **ih, char * /* errbuf */, int /* errbuf_size */)
++{
++  Config *const config = new Config;
++  if (2 < argc) {
++    config->fromArgs(argc - 2, argv + 2);
++  }
++  *ih = static_cast<void *>(config);
++  return TS_SUCCESS;
++}
++
++SLICE_EXPORT
++void
++TSRemapDeleteInstance(void *ih)
++{
++  if (nullptr != ih) {
++    Config *const config = static_cast<Config *>(ih);
++    delete config;
++  }
++}
++
++SLICE_EXPORT
++TSReturnCode
++TSRemapInit(TSRemapInterface *api_info, char *errbug, int errbuf_size)
++{
++  DEBUG_LOG("slice remap is successfully initialized.");
++  return TS_SUCCESS;
++}
++
++///// global plugin
++SLICE_EXPORT
++void
++TSPluginInit(int argc, char const *argv[])
++{
++  TSPluginRegistrationInfo info;
++  info.plugin_name   = (char *)PLUGIN_NAME;
++  info.vendor_name   = (char *)"Apache Software Foundation";
++  info.support_email = (char *)"dev@trafficserver.apache.org";
++
++  if (TS_SUCCESS != TSPluginRegister(&info)) {
++    ERROR_LOG("Plugin registration failed.\n");
++    ERROR_LOG("Unable to initialize plugin (disabled).");
++    return;
++  }
++
++  if (1 < argc) {
++    globalConfig.fromArgs(argc - 1, argv + 1);
++  }
++
++  TSCont const contp(TSContCreate(global_read_request_hook, nullptr));
++
++  // Called immediately after the request header is read from the client
++  TSHttpHookAdd(TS_HTTP_READ_REQUEST_HDR_HOOK, contp);
++}
+diff --git a/plugins/experimental/slice/slice.h b/plugins/experimental/slice/slice.h
+new file mode 100644
+index 0000000..682c016
+--- /dev/null
++++ b/plugins/experimental/slice/slice.h
+@@ -0,0 +1,54 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "ts/ts.h"
++
++#include <cstring>
++
++#ifndef SLICE_EXPORT
++#define SLICE_EXPORT extern "C" tsapi
++#endif
++
++#ifndef PLUGIN_NAME
++#define PLUGIN_NAME "slice"
++#endif
++
++#if !defined(UNITTEST)
++
++#define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
++#define DEBUG_LOG(fmt, ...)                                                      \
++  TSDebug(PLUGIN_NAME, "[%s:%04d] %s(): " fmt, __FILENAME__, __LINE__, __func__, \
++          ##__VA_ARGS__) /*                                                      \
++                                 ; fprintf(stderr, "[%s:%04d]: " fmt "\n"        \
++                                         , __FILENAME__                          \
++                                         , __LINE__                              \
++                                         , ##__VA_ARGS__)                        \
++                         */
++
++#define ERROR_LOG(fmt, ...)                                                         \
++  TSError("[%s:%04d] %s(): " fmt, __FILENAME__, __LINE__, __func__, ##__VA_ARGS__); \
++  TSDebug(PLUGIN_NAME, "[%s:%04d] %s(): " fmt, __FILENAME__, __LINE__, __func__, ##__VA_ARGS__)
++
++#else
++
++#define DEBUG_LOG(fmt, ...)
++#define ERROR_LOG(fmt, ...)
++
++#endif
+diff --git a/plugins/experimental/slice/slice_test.cc b/plugins/experimental/slice/slice_test.cc
+new file mode 100644
+index 0000000..4fcbc5b
+--- /dev/null
++++ b/plugins/experimental/slice/slice_test.cc
+@@ -0,0 +1,195 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++/*
++ * These are misc unit tests for slicer
++ */
++
++#include "ContentRange.h"
++#include "Range.h"
++
++#include <cassert>
++#include <iostream>
++#include <limits>
++#include <sstream>
++#include <vector>
++
++std::string
++testContentRange()
++{
++  std::ostringstream oss;
++
++  ContentRange null;
++  if (null.isValid()) {
++    oss << "fail: null isValid test" << std::endl;
++  }
++
++  ContentRange const exprange(1023, 1048576, 307232768);
++
++  if (!exprange.isValid()) {
++    oss << "Fail: exprange valid" << std::endl;
++    oss << exprange.m_beg << ' ' << exprange.m_end << ' ' << exprange.m_length << std::endl;
++  }
++
++  std::string const expstr("bytes 1023-1048575/307232768");
++
++  char gotbuf[1024];
++  int gotlen = sizeof(gotbuf);
++
++  bool const strstat(exprange.toStringClosed(gotbuf, &gotlen));
++
++  if (!strstat) {
++    oss << "failure status toStringClosed" << std::endl;
++  } else if ((int)expstr.size() != gotlen) {
++    oss << "Fail: expected toStringClosed length" << std::endl;
++    oss << "got: " << gotlen << " exp: " << expstr.size() << std::endl;
++    oss << "Got: " << gotbuf << std::endl;
++    oss << "Exp: " << expstr << std::endl;
++  } else if (expstr != gotbuf) {
++    oss << "Fail: expected toStringClosed value" << std::endl;
++    oss << "Got: " << gotbuf << std::endl;
++    oss << "Exp: " << expstr << std::endl;
++  }
++
++  ContentRange gotrange;
++  bool const gotstat(gotrange.fromStringClosed(expstr.c_str()));
++  if (!gotstat) {
++    oss << "fail: gotstat from string" << std::endl;
++  } else if (gotrange.m_beg != exprange.m_beg || gotrange.m_end != exprange.m_end || gotrange.m_length != exprange.m_length) {
++    oss << "fail: value compare gotrange and exprange" << std::endl;
++  }
++
++  std::string const teststr("bytes 0-1048575/30723276");
++  if (!gotrange.fromStringClosed(teststr.c_str())) {
++    oss << "fail: parse teststr" << std::endl;
++  }
++
++  return oss.str();
++}
++
++std::string
++testParseRange()
++{
++  std::ostringstream oss;
++
++  std::vector<std::string> const teststrings = {
++    "bytes=0-1023",
++    "bytes=1-1024",
++    "bytes=11-11",
++    "bytes=1-" // 2nd byte to end
++    ,
++    "Range: bytes=-13" // final 13 bytes
++    ,
++    "bytes=3-17" // ,23-29" // open
++    ,
++    "bytes=3 -17 " //,18-29" // adjacent
++    ,
++    "bytes=3- 17" //, 11-29" // overlapping
++    ,
++    "bytes=3 - 11" //,13-17 , 23-29" // unsorted triplet
++    ,
++    "bytes=3-11 " //,13-17, 23-29" // unsorted triplet
++    ,
++    "bytes=0-0" //,-1" // first and last bytes
++    ,
++    "bytes=-20" // last 20 bytes of file
++
++    ,
++    "bytes=-60-50" // invalid fully negative
++    ,
++    "bytes=17-13" // degenerate
++    ,
++    "bytes 0-1023/146515" // this should be rejected (Content-range)
++  };                      // invalid
++
++  std::vector<Range> const exps = {Range{0, 1023 + 1}, Range{1, 1024 + 1}, Range{11, 11 + 1}, Range{1, Range::maxval},
++                                   Range{-1, -1},      Range{3, 17 + 1},   Range{3, 17 + 1},  Range{3, 17 + 1},
++                                   Range{3, 11 + 1},   Range{3, 11 + 1},   Range{0, 1},       Range{-20, 0},
++                                   Range{-1, -1},      Range{-1, -1},      Range{-1, -1}};
++
++  std::vector<bool> const expsres = {true, true, true, true, false, true, true, true, true, true, true, true, false, false, false};
++
++  assert(exps.size() == teststrings.size());
++
++  std::vector<Range> gots;
++  gots.reserve(exps.size());
++  std::vector<bool> gotsres;
++
++  for (std::string const &str : teststrings) {
++    Range rng;
++    gotsres.push_back(rng.fromStringClosed(str.c_str()));
++    gots.push_back(rng);
++  }
++
++  assert(gots.size() == exps.size());
++
++  for (size_t index(0); index < gots.size(); ++index) {
++    if (exps[index] != gots[index] || expsres[index] != gotsres[index]) {
++      oss << "Error parsing index: " << index << std::endl;
++      oss << "test: '" << teststrings[index] << "'" << std::endl;
++      oss << "exp: " << exps[index].m_beg << ' ' << exps[index].m_end << std::endl;
++      oss << "expsres: " << (int)expsres[index] << std::endl;
++      oss << "got: " << gots[index].m_beg << ' ' << gots[index].m_end << std::endl;
++      oss << "gotsres: " << (int)gotsres[index] << std::endl;
++    }
++  }
++
++  return oss.str();
++}
++
++struct Tests {
++  typedef std::string (*TestFunc)();
++  std::vector<std::pair<TestFunc, char const *>> funcs;
++
++  void
++  add(TestFunc const &func, char const *const fname)
++  {
++    funcs.push_back(std::make_pair(func, fname));
++  }
++
++  int
++  run() const
++  {
++    int numfailed(0);
++    for (std::pair<TestFunc, char const *> const &namefunc : funcs) {
++      TestFunc const &func   = namefunc.first;
++      char const *const name = namefunc.second;
++
++      std::cerr << name << " : ";
++
++      std::string const fres(func());
++      if (fres.empty()) {
++        std::cerr << "pass" << std::endl;
++      } else {
++        std::cerr << "FAIL" << std::endl;
++        std::cerr << fres << std::endl;
++        ++numfailed;
++      }
++    }
++    return numfailed;
++  }
++};
++
++int
++main()
++{
++  Tests tests;
++  tests.add(testContentRange, "testContentRange");
++  tests.add(testParseRange, "testParseRange");
++  return tests.run();
++}
+diff --git a/plugins/experimental/slice/transfer.cc b/plugins/experimental/slice/transfer.cc
+new file mode 100644
+index 0000000..4ab7a8b
+--- /dev/null
++++ b/plugins/experimental/slice/transfer.cc
+@@ -0,0 +1,105 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#include "transfer.h"
++
++int64_t transfer_content_bytes(Data *const data) // , char const * const fstr)
++{
++  int64_t consumed(0);
++
++  // is the downstream is fulfilled or closed
++  if (!data->m_dnstream.m_write.isOpen()) {
++    // drain the upstream
++    if (data->m_upstream.m_read.isOpen()) {
++      int64_t const avail = TSIOBufferReaderAvail(data->m_upstream.m_read.m_reader);
++      TSIOBufferReaderConsume(data->m_upstream.m_read.m_reader, avail);
++      consumed += avail;
++    }
++  } else // if (data->m_dnstream.m_write.isOpen())
++  {
++    if (data->m_upstream.m_read.isOpen()) {
++      int64_t avail = TSIOBufferReaderAvail(data->m_upstream.m_read.m_reader);
++      if (0 < avail) {
++        int64_t const toskip = std::min(data->m_blockskip, avail);
++
++        // consume any up front (first block) padding
++        if (0 < toskip) {
++          TSIOBufferReaderConsume(data->m_upstream.m_read.m_reader, toskip);
++          data->m_blockskip -= toskip;
++          avail -= toskip;
++          consumed += toskip;
++        }
++
++        if (0 < avail) {
++          int64_t const bytesleft = (data->m_bytestosend - data->m_bytessent);
++          int64_t const tocopy    = std::min(avail, bytesleft);
++
++          if (0 < tocopy) {
++            int64_t const copied(TSIOBufferCopy(data->m_dnstream.m_write.m_iobuf, data->m_upstream.m_read.m_reader, tocopy, 0));
++
++            data->m_bytessent += copied;
++
++            TSIOBufferReaderConsume(data->m_upstream.m_read.m_reader, copied);
++
++            avail -= copied;
++            consumed += copied;
++          }
++        }
++
++        // if hit fulfillment start bulk consuming
++        if (0 < avail && data->m_bytestosend <= data->m_bytessent) {
++          TSIOBufferReaderConsume(data->m_upstream.m_read.m_reader, avail);
++          consumed += avail;
++        }
++      }
++
++      if (0 < consumed) {
++        TSVIOReenable(data->m_dnstream.m_write.m_vio);
++      }
++    }
++  }
++
++  if (0 < consumed) {
++    data->m_blockconsumed += consumed;
++  }
++
++  return consumed;
++}
++
++// transfer all bytes from the server (error condition)
++int64_t
++transfer_all_bytes(Data *const data)
++{
++  DEBUG_LOG("transfer_all_bytes");
++  int64_t consumed = 0;
++
++  if (data->m_dnstream.m_write.isOpen()) {
++    int64_t const read_avail = TSIOBufferReaderAvail(data->m_upstream.m_read.m_reader);
++
++    if (0 < read_avail) {
++      int64_t const copied(TSIOBufferCopy(data->m_dnstream.m_write.m_iobuf, data->m_upstream.m_read.m_reader, read_avail, 0));
++
++      if (0 < copied) {
++        TSIOBufferReaderConsume(data->m_upstream.m_read.m_reader, copied);
++        consumed = copied;
++      }
++    }
++  }
++
++  return consumed;
++}
+diff --git a/plugins/experimental/slice/transfer.h b/plugins/experimental/slice/transfer.h
+new file mode 100644
+index 0000000..de3e176
+--- /dev/null
++++ b/plugins/experimental/slice/transfer.h
+@@ -0,0 +1,34 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++#pragma once
++
++#include "Data.h"
++
++/** Functions to deal with the connection to the client.
++ * Body content transfers are handled by the client.
++ * New block requests are also initiated by the client.
++ */
++
++/* transfer bytes from the server to the client
++ * Returns amount of bytes consumed from the reader (<= bytes written to client)
++ */
++int64_t transfer_content_bytes(Data *const data); // , char const * const fstr);
++
++// transfer all bytes from the server (error condition)
++int64_t transfer_all_bytes(Data *const data);
+diff --git a/plugins/experimental/slice/unit-tests/slice_test.cc b/plugins/experimental/slice/unit-tests/slice_test.cc
+new file mode 100644
+index 0000000..96ae726
+--- /dev/null
++++ b/plugins/experimental/slice/unit-tests/slice_test.cc
+@@ -0,0 +1,181 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++/*
++ * These are misc unit tests for slicer
++ */
++
++#include "ContentRange.h"
++#include "Range.h"
++
++#include <cassert>
++#include <iostream>
++#include <limits>
++#include <sstream>
++#include <vector>
++
++std::string
++testContentRange()
++{
++  std::ostringstream oss;
++
++  ContentRange null;
++  if (null.isValid()) {
++    oss << "fail: null isValid test" << std::endl;
++  }
++
++  ContentRange const exprange(1023, 1048576, 307232768);
++
++  if (!exprange.isValid()) {
++    oss << "Fail: exprange valid" << std::endl;
++    oss << exprange.m_beg << ' ' << exprange.m_end << ' ' << exprange.m_length << std::endl;
++  }
++
++  std::string const expstr("bytes 1023-1048575/307232768");
++
++  char gotbuf[1024];
++  int gotlen = sizeof(gotbuf);
++
++  bool const strstat(exprange.toStringClosed(gotbuf, &gotlen));
++
++  if (!strstat) {
++    oss << "failure status toStringClosed" << std::endl;
++  } else if ((int)expstr.size() != gotlen) {
++    oss << "Fail: expected toStringClosed length" << std::endl;
++    oss << "got: " << gotlen << " exp: " << expstr.size() << std::endl;
++    oss << "Got: " << gotbuf << std::endl;
++    oss << "Exp: " << expstr << std::endl;
++  } else if (expstr != gotbuf) {
++    oss << "Fail: expected toStringClosed value" << std::endl;
++    oss << "Got: " << gotbuf << std::endl;
++    oss << "Exp: " << expstr << std::endl;
++  }
++
++  ContentRange gotrange;
++  bool const gotstat(gotrange.fromStringClosed(expstr.c_str()));
++  if (!gotstat) {
++    oss << "fail: gotstat from string" << std::endl;
++  } else if (gotrange.m_beg != exprange.m_beg || gotrange.m_end != exprange.m_end || gotrange.m_length != exprange.m_length) {
++    oss << "fail: value compare gotrange and exprange" << std::endl;
++  }
++
++  std::string const teststr("bytes 0-1048575/30723276");
++  if (!gotrange.fromStringClosed(teststr.c_str())) {
++    oss << "fail: parse teststr" << std::endl;
++  }
++
++  return oss.str();
++}
++
++std::string
++testParseRange()
++{
++  std::ostringstream oss;
++
++  std::vector<std::string> const teststrings = {
++    "bytes=0-1023",       "bytes=1-1024", "bytes=11-11",
++    "bytes=1-",           // 2nd byte to end
++    "Range: bytes=-13",   // final 13 bytes
++    "bytes=3-17",         // ,23-29" // open
++    "bytes=3 -17 ",       //,18-29" // adjacent
++    "bytes=3- 17",        //, 11-29" // overlapping
++    "bytes=3 - 11",       //,13-17 , 23-29" // unsorted triplet
++    "bytes=3-11 ",        //,13-17, 23-29" // unsorted triplet
++    "bytes=0-0",          //,-1" // first and last bytes
++    "bytes=-20",          // last 20 bytes of file
++    "bytes=-60-50",       // invalid fully negative
++    "bytes=17-13",        // degenerate
++    "bytes 0-1023/146515" // this should be rejected (Content-range)
++  };                      // invalid
++
++  std::vector<Range> const exps = {Range{0, 1023 + 1}, Range{1, 1024 + 1}, Range{11, 11 + 1}, Range{1, Range::maxval},
++                                   Range{-1, -1},      Range{3, 17 + 1},   Range{3, 17 + 1},  Range{3, 17 + 1},
++                                   Range{3, 11 + 1},   Range{3, 11 + 1},   Range{0, 1},       Range{-20, 0},
++                                   Range{-1, -1},      Range{-1, -1},      Range{-1, -1}};
++
++  std::vector<bool> const expsres = {true, true, true, true, false, true, true, true, true, true, true, true, false, false, false};
++
++  assert(exps.size() == teststrings.size());
++
++  std::vector<Range> gots;
++  gots.reserve(exps.size());
++  std::vector<bool> gotsres;
++
++  for (std::string const &str : teststrings) {
++    Range rng;
++    gotsres.push_back(rng.fromStringClosed(str.c_str()));
++    gots.push_back(rng);
++  }
++
++  assert(gots.size() == exps.size());
++
++  for (size_t index(0); index < gots.size(); ++index) {
++    if (exps[index] != gots[index] || expsres[index] != gotsres[index]) {
++      oss << "Eror parsing index: " << index << std::endl;
++      oss << "test: '" << teststrings[index] << "'" << std::endl;
++      oss << "exp: " << exps[index].m_beg << ' ' << exps[index].m_end << std::endl;
++      oss << "expsres: " << (int)expsres[index] << std::endl;
++      oss << "got: " << gots[index].m_beg << ' ' << gots[index].m_end << std::endl;
++      oss << "gotsres: " << (int)gotsres[index] << std::endl;
++    }
++  }
++
++  return oss.str();
++}
++
++struct Tests {
++  typedef std::string (*TestFunc)();
++  std::vector<std::pair<TestFunc, char const *>> funcs;
++
++  void
++  add(TestFunc const &func, char const *const fname)
++  {
++    funcs.push_back(std::make_pair(func, fname));
++  }
++
++  int
++  run() const
++  {
++    int numfailed(0);
++    for (std::pair<TestFunc, char const *> const &namefunc : funcs) {
++      TestFunc const &func   = namefunc.first;
++      char const *const name = namefunc.second;
++
++      std::cerr << name << " : ";
++
++      std::string const fres(func());
++      if (fres.empty()) {
++        std::cerr << "pass" << std::endl;
++      } else {
++        std::cerr << "FAIL" << std::endl;
++        std::cerr << fres << std::endl;
++        ++numfailed;
++      }
++    }
++    return numfailed;
++  }
++};
++
++int
++main()
++{
++  Tests tests;
++  tests.add(testContentRange, "testContentRange");
++  tests.add(testParseRange, "testParseRange");
++  return tests.run();
++}
+diff --git a/plugins/experimental/slice/unit-tests/test_config.cc b/plugins/experimental/slice/unit-tests/test_config.cc
+new file mode 100644
+index 0000000..b85f381
+--- /dev/null
++++ b/plugins/experimental/slice/unit-tests/test_config.cc
+@@ -0,0 +1,86 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++/**
++ * @file test_content_range.cc
++ * @brief Unit test for slice ContentRange
++ */
++
++#define CATCH_CONFIG_MAIN /* include main function */
++#include "../Config.h"
++#include "catch.hpp" /* catch unit-test framework */
++
++#include <array>
++
++TEST_CASE("config default", "[AWS][slice][utility]")
++{
++  Config const config;
++  int64_t const defval = Config::blockbytesdefault;
++  CHECK(defval == config.m_blockbytes);
++}
++
++TEST_CASE("config bytesfrom valid parsing", "[AWS][slice][utility]")
++{
++  static std::array<std::string, 6> const teststrings = {{
++    "1000",
++    "1m",
++    "5g",
++    "2k",
++    "3kb",
++    "1z",
++  }};
++
++  constexpr std::array<int64_t, 6> const expvals = {{
++    1000,
++    1024 * 1024,
++    int64_t(1024) * 1024 * 1024 * 5,
++    1024 * 2,
++    1024 * 3,
++    1,
++  }};
++
++  for (size_t index = 0; index < teststrings.size(); ++index) {
++    std::string const &teststr = teststrings[index];
++    int64_t const &exp         = expvals[index];
++    int64_t const got          = Config::bytesFrom(teststr.c_str());
++
++    CHECK(got == exp);
++    if (got != exp) {
++      INFO(teststr.c_str());
++    }
++  }
++}
++
++TEST_CASE("config bytesfrom invalid parsing", "[AWS][slice][utility]")
++{
++  static std::array<std::string, 5> const badstrings = {{
++    "abc",  // alpha
++    "g00",  // giga
++    "M00",  // mega
++    "k00",  // kilo
++    "-500", // negative
++  }};
++
++  for (std::string const &badstr : badstrings) {
++    int64_t const val = Config::bytesFrom(badstr.c_str());
++    CHECK(0 == val);
++    if (0 != val) {
++      INFO(badstr.c_str());
++    }
++  }
++}
+diff --git a/plugins/experimental/slice/unit-tests/test_content_range.cc b/plugins/experimental/slice/unit-tests/test_content_range.cc
+new file mode 100644
+index 0000000..a987629
+--- /dev/null
++++ b/plugins/experimental/slice/unit-tests/test_content_range.cc
+@@ -0,0 +1,80 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++/**
++ * @file test_content_range.cc
++ * @brief Unit test for slice ContentRange
++ */
++
++#define CATCH_CONFIG_MAIN /* include main function */
++#include "catch.hpp"      /* catch unit-test framework */
++#include "../ContentRange.h"
++
++TEST_CASE("content_range invalid state", "[AWS][slice][utility]")
++{
++  CHECK_FALSE(ContentRange().isValid());                 // null range
++  CHECK_FALSE(ContentRange(1024, 1024, 4000).isValid()); // zero range
++  CHECK_FALSE(ContentRange(0, 1024, 1023).isValid());    // past end
++  CHECK_FALSE(ContentRange(-5, 13, 40).isValid());       // negative start
++}
++
++TEST_CASE("content_range to/from string - valid", "[AWS][slice][utility]")
++{
++  ContentRange const exprange(1023, 1048576, 307232768);
++
++  CHECK(exprange.isValid());
++
++  std::string const expstr("bytes 1023-1048575/307232768");
++
++  char gotbuf[1024];
++  int gotlen = sizeof(gotbuf);
++
++  bool const strstat(exprange.toStringClosed(gotbuf, &gotlen));
++
++  CHECK(strstat);
++  CHECK(gotlen == expstr.size());
++  CHECK(expstr == std::string(gotbuf));
++
++  ContentRange gotrange;
++  bool const gotstat(gotrange.fromStringClosed(expstr.c_str()));
++
++  CHECK(gotstat);
++  CHECK(gotrange.m_beg == exprange.m_beg);
++  CHECK(gotrange.m_end == exprange.m_end);
++  CHECK(gotrange.m_length == exprange.m_length);
++}
++
++TEST_CASE("content_range from string - invalid", "[AWS][slice][utility]")
++{
++  std::vector<std::string> const badstrings = {
++    "bytes=1024-1692",              // malformed
++    "bytes=1023-1048575/307232768", // malformed
++    "bytes 1023-1022/5000",         // zero size
++    "bytes -40-12/50",              // negative start
++    "bytes 5-13/11"                 // past end
++  };
++
++  ContentRange cr;
++
++  for (std::string const &badstr : badstrings) {
++    if (!cr.fromStringClosed(badstr.c_str())) {
++      CHECK_FALSE(cr.isValid());
++      INFO(badstr.c_str());
++    }
++  }
++}
+diff --git a/plugins/experimental/slice/unit-tests/test_range.cc b/plugins/experimental/slice/unit-tests/test_range.cc
+new file mode 100644
+index 0000000..d2b1813
+--- /dev/null
++++ b/plugins/experimental/slice/unit-tests/test_range.cc
+@@ -0,0 +1,99 @@
++/** @file
++  Licensed to the Apache Software Foundation (ASF) under one
++  or more contributor license agreements.  See the NOTICE file
++  distributed with this work for additional information
++  regarding copyright ownership.  The ASF licenses this file
++  to you under the Apache License, Version 2.0 (the
++  "License"); you may not use this file except in compliance
++  with the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++  Unless required by applicable law or agreed to in writing, software
++  distributed under the License is distributed on an "AS IS" BASIS,
++  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++  See the License for the specific language governing permissions and
++  limitations under the License.
++ */
++
++/**
++ * @file test_content_range.cc
++ * @brief Unit test for slice ContentRange
++ */
++
++#define CATCH_CONFIG_MAIN /* include main function */
++#include "catch.hpp"      /* catch unit-test framework */
++#include "../Range.h"
++
++TEST_CASE("range invalid state", "[AWS][slice][utility]")
++{
++  CHECK_FALSE(Range().isValid());           // null range
++  CHECK_FALSE(Range(1024, 1024).isValid()); // zero range
++  CHECK_FALSE(Range(-5, 13).isValid());     // negative start
++}
++
++TEST_CASE("range to/from string - valid", "[AWS][slice][utility]")
++{
++  std::vector<std::string> const teststrings = {
++    "bytes=0-1023", // start at zero
++    "bytes=1-1024", // start from non zero
++    "bytes=11-11",  // single byte
++    "bytes=1-",     // 2nd byte to end
++    "bytes=3-17",   // ,23-29" // open
++    "bytes=3 -17 ", //,18-29" // adjacent
++    "bytes=3- 17",  //, 11-29" // overlapping
++    "bytes=3 - 11", //,13-17 , 23-29" // unsorted triplet
++    "bytes=3-11 ",  //,13-17, 23-29" // unsorted triplet
++    "bytes=0-0",    //,-1" // first and last bytes
++    "bytes=-20",    // last 20 bytes of file
++  };
++
++  std::vector<Range> const exps = {
++    Range{0, 1023 + 1},      //
++    Range{1, 1024 + 1},      //
++    Range{11, 11 + 1},       //
++    Range{1, Range::maxval}, //
++    Range{3, 17 + 1},        //
++    Range{3, 17 + 1},        //
++    Range{3, 17 + 1},        //
++    Range{3, 11 + 1},        //
++    Range{3, 11 + 1},        //
++    Range{0, 1},             //
++    Range{-20, 0}            //
++  };
++
++  for (size_t index = 0; index < teststrings.size(); ++index) {
++    std::string const &str = teststrings[index];
++
++    Range got;
++    CHECK(got.fromStringClosed(str.c_str()));
++    CHECK(got.isValid());
++
++    if (!got.isValid()) {
++      INFO(str.c_str());
++    }
++
++    Range const &exp = exps[index];
++    CHECK(got.m_beg == exp.m_beg);
++    CHECK(got.m_end == exp.m_end);
++  }
++}
++
++TEST_CASE("range from string - invalid")
++{
++  std::vector<std::string> const badstrings = {
++    "Range: bytes=-13",   // malformed
++    "bytes=-60-50",       // first negative, second nonzero
++    "bytes=17-13",        // degenerate
++    "bytes 0-1023/146515" // malformed
++  };
++
++  Range range;
++  for (std::string const &badstr : badstrings) {
++    CHECK_FALSE(range.fromStringClosed(badstr.c_str()));
++    CHECK_FALSE(range.isValid());
++    if (range.isValid()) {
++      INFO(badstr.c_str());
++    }
++  }
++}

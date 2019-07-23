@@ -1,0 +1,5 @@
+BUILD/
+RPMS/
+SRPMS/
+trafficserver-*.tar.bz2
+trafficserver-*.tar.bz2.asc
