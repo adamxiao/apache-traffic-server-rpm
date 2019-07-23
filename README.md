@@ -8,6 +8,7 @@ build command
 
 ```
 yum install rpmrebuild rpmdevtools
-spectool -g -R SPECS/trafficserver.spec
-rpmbuild -ba SPECS/trafficserver.spec
+yum-builddep SPECS/trafficserver.spec
+spectool -C ./SOURCES -g SPECS/trafficserver.spec
+rpmbuild --define '_topdir %{getenv:PWD}' -ba SPECS/trafficserver.spec
 ```

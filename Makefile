@@ -1,2 +1,2 @@
 all:
-	rpmbuild -ba ./SPECS/trafficserver.spec
+	rpmbuild --define '_topdir $(PWD)' -ba ./SPECS/trafficserver.spec
