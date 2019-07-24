@@ -1,6 +1,6 @@
 # apache-traffic-server-rpm
 
-refer https://github.com/adamxiao/apache-traffic-server-rpm
+refer https://pkgs.org/download/trafficserver
 
 add some patch, and my configure file
 

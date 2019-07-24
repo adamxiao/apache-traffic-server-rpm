@@ -5,7 +5,7 @@
 
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
-Version:	7.1.6
+Version:	6.2.3
 Release:	1%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
@@ -20,10 +20,10 @@ Source5:	trafficserver.tmpfilesd
 Patch1:		trafficserver-init_scripts.patch
 
 Patch101:	trafficserver-6.2.0-require-s-maxage.patch
-Patch102:	trafficserver-7.1.4.return_stale_cache_with_s_maxage.patch
-Patch103:	adam_certifier_slice.patch
-Patch104:	adam_collapsed_fix.patch
-Patch105:	adam_certifier_fix.patch
+Patch102:	adam_certifier_slice.patch
+Patch103:	adam_collapsed_fix.patch
+Patch104:	adam_collapsed_forwarding.patch
+Patch105:	adam_ts_lua_fix.patch
 
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
@@ -31,6 +31,7 @@ BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 ExcludeArch:	%{arm} s390 s390x
 
 BuildRequires:	boost-devel
+BuildRequires:	expat-devel
 BuildRequires:	gcc-c++
 BuildRequires:	gnupg
 BuildRequires:	hwloc-devel
@@ -95,6 +96,7 @@ NOCONFIGURE=1 autoreconf -vif
   --localstatedir=%{_prefix}%{_localstatedir} \
   --libexecdir=%{_prefix}/%{_lib}/plugins \
   --with-tcl=/usr/%{_lib} \
+  --enable-luajit \
   --with-user=ats --with-group=ats \
   --disable-silent-rules \
   --enable-experimental-plugins
@@ -216,8 +218,7 @@ fi
 %{_bindir}/tspush
 %dir %{_libdir}
 %dir %{_libdir}/plugins
-%{_libdir}/libts*.so.7*
-%{_libdir}/libatscppapi*.so.7*
+%{_libdir}/libts*.so.6*
 %{_libdir}/plugins/*.so
 %if %{?fedora}0 > 140 || %{?rhel}0 > 60
 /lib/systemd/system/trafficserver.service
@@ -235,45 +236,23 @@ fi
 
 %files perl
 %defattr(-,root,root,-)
-%{_prefix}/share/man/man3/*
+%{_prefix}/man/man3/*
+%{_prefix}/lib/perl5/Apache/TS.pm.in
 %{_prefix}/lib/perl5/Apache/TS.pm
 %{_prefix}/lib/perl5/Apache/TS/*
+%{_prefix}/lib/perl5/Apache/TS/Config/*
 
 %files devel
 %defattr(-,root,root,-)
 %{_bindir}/tsxs
+%{_bindir}/header_rewrite_test
 %{_includedir}/ts
-%{_includedir}/atscppapi
 %{_libdir}/*.so
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
-* Mon Feb 25 2019 Hiroaki Nakamura <hnakamur@gmail.com> 7.1.6-1
-- Update to 7.1.6 LTS release
-- Return stale cache with s-maxage only if
-  cache_required_headers is 99
-
-* Fri Apr 20 2018 Hiroaki Nakamura <hnakamur@gmail.com> 7.1.3-1
-- Update to 7.1.3 LTS release
-
-* Mon Mar 26 2018 Hiroaki Nakamura <hnakamur@gmail.com> 7.1.2-1
-- Update to 7.1.2 LTS release
-
-* Tue Oct 24 2017 Hiroaki Nakamura <hnakamur@gmail.com> 7.1.1-1
-- Update to 7.1.1 LTS release
-
-* Thu Aug  3 2017 Hiroaki Nakamura <hnakamur@gmail.com> 7.1.0-1
-- Update to 7.1.0 LTS release
-
-* Wed Nov 16 2016 Hiroaki Nakamura <hnakamur@gmail.com> 7.0.0-2
-- Remove expat-devel from build dependencies
-
-* Wed Nov 16 2016 Hiroaki Nakamura <hnakamur@gmail.com> 7.0.0-1
-- Update to 7.0.0 LTS release
-
-* Fri Sep 30 2016 Hiroaki Nakamura <hnakamur@gmail.com> 6.2.0-2
-- Return stale cache even if the origin server response has
-  "Cache-Control: s-maxage" header.
+* Sat Aug 27 2016 Bryan Seitz <seitz@ghettoforge.org> - 6.2.0-1
+- Imported into GhettoForge
 
 * Wed Jul 27 2016 Hiroaki Nakamura <hnakamur@gmail.com> 6.2.0-1
 - Update to 6.2.0 LTS release

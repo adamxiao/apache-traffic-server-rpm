@@ -1,23 +1,56 @@
-diff --git a/plugins/Makefile.am b/plugins/Makefile.am
-index 32e14db..a226657 100644
---- a/plugins/Makefile.am
-+++ b/plugins/Makefile.am
-@@ -50,6 +50,7 @@ include experimental/balancer/Makefile.inc
- include experimental/buffer_upload/Makefile.inc
- include experimental/cache_promote/Makefile.inc
- include experimental/cache_range_requests/Makefile.inc
-+include experimental/certifier/Makefile.inc
- include experimental/cachekey/Makefile.inc
- include experimental/collapsed_connection/Makefile.inc
- include experimental/collapsed_forwarding/Makefile.inc
-@@ -69,6 +70,7 @@ include experimental/mp4/Makefile.inc
- include experimental/multiplexer/Makefile.inc
- include experimental/remap_purge/Makefile.inc
- include experimental/ssl_cert_loader/Makefile.inc
-+include experimental/slice/Makefile.inc
- include experimental/sslheaders/Makefile.inc
- include experimental/stale_while_revalidate/Makefile.inc
- include experimental/stream_editor/Makefile.inc
+diff --git a/configure.ac b/configure.ac
+index 808517e..6ba19ee 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1998,6 +1998,8 @@ AC_CONFIG_FILES([
+   plugins/experimental/s3_auth/Makefile
+   plugins/experimental/ssl_cert_loader/Makefile
+   plugins/experimental/sslheaders/Makefile
++  plugins/experimental/certifier/Makefile
++  plugins/experimental/slice/Makefile
+   plugins/experimental/stale_while_revalidate/Makefile
+   plugins/experimental/stream_editor/Makefile
+   plugins/experimental/ts_lua/Makefile
+diff --git a/plugins/experimental/Makefile.am b/plugins/experimental/Makefile.am
+index a530a38..0d4ffbd 100644
+--- a/plugins/experimental/Makefile.am
++++ b/plugins/experimental/Makefile.am
+@@ -43,6 +43,8 @@ SUBDIRS = \
+  s3_auth \
+  ssl_cert_loader \
+  sslheaders \
++ certifier \
++ slice \
+  stale_while_revalidate \
+  url_sig \
+  xdebug \
+diff --git a/plugins/experimental/certifier/Makefile.am b/plugins/experimental/certifier/Makefile.am
+new file mode 100644
+index 0000000..d9dcaaa
+--- /dev/null
++++ b/plugins/experimental/certifier/Makefile.am
+@@ -0,0 +1,21 @@
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++include $(top_srcdir)/build/plugins.mk
++
++pkglib_LTLIBRARIES = certifier.la
++certifier_la_SOURCES = certifier.cc
++certifier_la_LDFLAGS = $(TS_PLUGIN_LDFLAGS)
 diff --git a/plugins/experimental/certifier/Makefile.inc b/plugins/experimental/certifier/Makefile.inc
 new file mode 100644
 index 0000000..fa12713
@@ -1939,6 +1972,34 @@ index 0000000..bfd9c4d
 +    return nullptr != m_lochdr;
 +  }
 +};
+diff --git a/plugins/experimental/slice/Makefile.am b/plugins/experimental/slice/Makefile.am
+new file mode 100644
+index 0000000..def82c1
+--- /dev/null
++++ b/plugins/experimental/slice/Makefile.am
+@@ -0,0 +1,22 @@
++#  Licensed to the Apache Software Foundation (ASF) under one
++#  or more contributor license agreements.  See the NOTICE file
++#  distributed with this work for additional information
++#  regarding copyright ownership.  The ASF licenses this file
++#  to you under the Apache License, Version 2.0 (the
++#  "License"); you may not use this file except in compliance
++#  with the License.  You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++#  Unless required by applicable law or agreed to in writing, software
++#  distributed under the License is distributed on an "AS IS" BASIS,
++#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++#  See the License for the specific language governing permissions and
++#  limitations under the License.
++
++include $(top_srcdir)/build/plugins.mk
++
++pkglib_LTLIBRARIES = slice.la
++slice_la_SOURCES = client.cc client.h Config.cc Config.h ContentRange.cc ContentRange.h Data.cc Data.h HttpHeader.cc HttpHeader.h intercept.cc intercept.h Range.cc Range.h response.cc response.h server.cc server.h slice.cc slice.h Stage.h transfer.cc transfer.h
++slice_la_LDFLAGS = $(TS_PLUGIN_LDFLAGS)
++
 diff --git a/plugins/experimental/slice/Makefile.inc b/plugins/experimental/slice/Makefile.inc
 new file mode 100644
 index 0000000..dbac02b
