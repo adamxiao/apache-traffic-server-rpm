@@ -6,7 +6,7 @@
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	6.2.3
-Release:	1%{?dist}
+Release:	4%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -24,6 +24,7 @@ Patch102:	adam_certifier_slice.patch
 Patch103:	adam_collapsed_fix.patch
 Patch104:	adam_collapsed_forwarding.patch
 Patch105:	adam_ts_lua_fix.patch
+Patch106:	adam_certifier_fix.patch
 
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
@@ -87,6 +88,7 @@ The trafficserver-perl package contains perl bindings.
 %patch103 -p1
 %patch104 -p1
 %patch105 -p1
+%patch106 -p1
 
 %build
 NOCONFIGURE=1 autoreconf -vif
