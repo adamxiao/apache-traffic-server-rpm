@@ -1,5 +1,5 @@
 diff --git a/plugins/experimental/certifier/certifier.cc b/plugins/experimental/certifier/certifier.cc
-index 9415d75..a7c0310 100644
+index 9415d75..30c2231 100644
 --- a/plugins/experimental/certifier/certifier.cc
 +++ b/plugins/experimental/certifier/certifier.cc
 @@ -42,11 +42,18 @@
@@ -21,14 +21,26 @@ index 9415d75..a7c0310 100644
  /// Override default delete for unique ptrs to openSSL objects
  namespace std
  {
-@@ -349,6 +356,71 @@ mkcsr(const char *cn)
+@@ -308,9 +315,11 @@ static scoped_X509 ca_cert_scoped;
+ static scoped_EVP_PKEY ca_pkey_scoped;
+ // static scoped_EVP_PKEY  ts_pkey_scoped;
+ 
++#if 0
+ static int ca_serial;            ///< serial number
+ static std::fstream serial_file; ///< serial number file
+ static TSMutex serial_mutex;     ///< serial number mutex
++#endif
+ 
+ // Management Object
+ static std::unique_ptr<SslLRUList> ssl_list = nullptr;
+@@ -349,9 +358,61 @@ mkcsr(const char *cn)
    return req;
  }
  
 +static  BIGNUM *createCertSerial(unsigned char *md, unsigned int n)
 +{
 +
-+    assert(n == 20); //for sha1 n is 20 (for md5 n is 16)
++    assert(n == MD5_DIGEST_LENGTH); //for sha1 n is 20 (for md5 n is 16)
 +
 +    BIGNUM *serial = NULL;
 +    serial = BN_bin2bn(md, n, NULL);
@@ -50,19 +62,6 @@ index 9415d75..a7c0310 100644
 +        BN_clear_bit(serial, 159);
 +
 +    return serial;
-+}
-+
-+/// Return the SHA1 digest of the DER encoded version of the certificate
-+/// stored in a BIGNUM
-+static BIGNUM *x509Digest(const X509 *data)
-+{
-+    unsigned int n;
-+    unsigned char md[EVP_MAX_MD_SIZE];
-+
-+    if (!X509_digest(data,EVP_sha1(),md,&n))
-+        return NULL;
-+
-+    return createCertSerial(md, n);
 +}
 +
 +/**
@@ -92,17 +91,42 @@ index 9415d75..a7c0310 100644
 +
  /// Local helper function that generates a X509 certificate based on CSR
  static scoped_X509
- mkcrt(X509_REQ *req, int serial)
-@@ -368,7 +440,7 @@ mkcrt(X509_REQ *req, int serial)
+-mkcrt(X509_REQ *req, int serial)
++mkcrt(X509_REQ *req, unsigned char *digest)
+ {
+   TSDebug(PLUGIN_NAME, "Entering mkcrt()...");
+   X509_NAME *subj, *tmpsubj;
+@@ -368,7 +429,15 @@ mkcrt(X509_REQ *req, int serial)
  
    /// Set serial number
    // TSDebug("txn_monitor", "serial: %d", serial);
 -  ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), serial);
 +  //ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), serial);
++  // gen serial number - added by adam 2019-07-22
++  BIGNUM *new_serial = createCertSerial(digest, MD5_DIGEST_LENGTH);
++  if (!setSerialNumber(X509_get_serialNumber(cert.get()), new_serial)) {
++    BN_free(new_serial);
++    TSError("[%s] mkcrt(): Failed to set serial number.", PLUGIN_NAME);
++    return nullptr;
++  }
++  BN_free(new_serial);
  
    /// Set issuer from CA cert
    if (X509_set_issuer_name(cert.get(), X509_get_subject_name(ca_cert_scoped.get())) == 0) {
-@@ -402,6 +474,45 @@ mkcrt(X509_REQ *req, int serial)
+@@ -376,8 +445,10 @@ mkcrt(X509_REQ *req, int serial)
+     return nullptr;
+   }
+   /// Set certificate time
+-  X509_gmtime_adj(X509_get_notBefore(cert.get()), 0);
+-  X509_gmtime_adj(X509_get_notAfter(cert.get()), (long)3650 * 24 * 3600);
++  //X509_gmtime_adj(X509_get_notBefore(cert.get()), 0);
++  //X509_gmtime_adj(X509_get_notAfter(cert.get()), (long)3650 * 24 * 3600);
++  ASN1_TIME_set_string( X509_get_notBefore(cert.get()), "20190723235959Z");
++  ASN1_TIME_set_string( X509_get_notAfter(cert.get()),  "20290723235959Z");
+ 
+   /// Get a handle to csr subject name
+   subj = X509_REQ_get_subject_name(req);
+@@ -402,6 +473,36 @@ mkcrt(X509_REQ *req, int serial)
      return nullptr;
    }
  
@@ -136,15 +160,84 @@ index 9415d75..a7c0310 100644
 +
 +  } while (0);
 +
-+  // gen serial number - added by adam 2019-07-22
-+  BIGNUM *new_serial = x509Digest(cert.get());
-+  if (!setSerialNumber(X509_get_serialNumber(cert.get()), new_serial)) {
-+    BN_free(new_serial);
-+    TSError("[%s] mkcrt(): Failed to set serial number.", PLUGIN_NAME);
-+    return nullptr;
-+  }
-+  BN_free(new_serial);
-+
    X509_sign(cert.get(), ca_pkey_scoped.get(), EVP_sha256());
  
    return cert;
+@@ -469,6 +570,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
+     }
+     TSDebug(PLUGIN_NAME, "shadow_cert_generator(): Creating shadow certs");
+ 
++#if 0
+     /// Get serial number
+     TSMutexLock(serial_mutex);
+     int serial = ca_serial++;
+@@ -480,6 +582,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
+     }
+ 
+     TSMutexUnlock(serial_mutex);
++#endif
+ 
+     /// Create CSR and cert
+     req = mkcsr(commonName.c_str());
+@@ -490,7 +593,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
+       return TS_ERROR;
+     }
+ 
+-    cert = mkcrt(req.get(), serial);
++    cert = mkcrt(req.get(), digest);
+ 
+     if (cert == nullptr) {
+       TSDebug(PLUGIN_NAME, "[shadow_cert_generator] Cert generation failed");
+@@ -593,12 +696,12 @@ TSPluginInit(int argc, const char *argv[])
+ 
+   const char *key    = nullptr;
+   const char *cert   = nullptr;
+-  const char *serial = nullptr;
++  //const char *serial = nullptr;
+ 
+   // Read options from plugin.config
+   static const struct option longopts[] = {
+     {"sign-cert", required_argument, nullptr, 'c'},   {"sign-key", required_argument, nullptr, 'k'},
+-    {"sign-serial", required_argument, nullptr, 'r'}, {"max", required_argument, nullptr, 'm'},
++    /* {"sign-serial", required_argument, nullptr, 'r'}, */ {"max", required_argument, nullptr, 'm'},
+     {"store", required_argument, nullptr, 's'},       {nullptr, no_argument, nullptr, 0}};
+ 
+   int opt = 0;
+@@ -614,10 +717,12 @@ TSPluginInit(int argc, const char *argv[])
+       key = optarg;
+       break;
+     }
++#if 0
+     case 'r': {
+       serial = optarg;
+       break;
+     }
++#endif
+     case 'm': {
+       ssl_list.reset(new SslLRUList(static_cast<int>(std::strtol(optarg, nullptr, 0))));
+       break;
+@@ -642,7 +747,7 @@ TSPluginInit(int argc, const char *argv[])
+   } else if ((cb_shadow = TSContCreate(cert_retriever, nullptr)) == nullptr) {
+     TSError("[%s] Unable to initialize plugin (disabled). Failed to create shadow cert cb.", PLUGIN_NAME);
+   } else {
+-    if ((sign_enabled = cert && key && serial)) {
++    if ((sign_enabled = cert && key /* && serial */)) {
+       // Dynamic cert generation enabled. Initialize CA key, cert and serial
+       // To comply to openssl, key and cert file are opened as FILE*
+       FILE *fp = nullptr;
+@@ -668,6 +773,7 @@ TSPluginInit(int argc, const char *argv[])
+         return;
+       }
+ 
++#if 0
+       // Read serial file
+       serial_file.open(serial, std::fstream::in | std::fstream::out);
+       if (!serial_file.is_open()) {
+@@ -684,6 +790,7 @@ TSPluginInit(int argc, const char *argv[])
+       if (serial_file.bad() || serial_file.fail()) {
+         ca_serial = 0;
+       }
++#endif
+     }
+     TSDebug(PLUGIN_NAME, "Dynamic cert generation %s", sign_enabled ? "enabled" : "disabled");
+ 
