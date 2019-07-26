@@ -1,5 +1,5 @@
 diff --git a/plugins/experimental/certifier/certifier.cc b/plugins/experimental/certifier/certifier.cc
-index 9415d75..30c2231 100644
+index 9415d75..cf003a4 100644
 --- a/plugins/experimental/certifier/certifier.cc
 +++ b/plugins/experimental/certifier/certifier.cc
 @@ -42,11 +42,18 @@
@@ -21,7 +21,20 @@ index 9415d75..30c2231 100644
  /// Override default delete for unique ptrs to openSSL objects
  namespace std
  {
-@@ -308,9 +315,11 @@ static scoped_X509 ca_cert_scoped;
+@@ -176,8 +183,10 @@ public:
+     auto iter = cnDataMap.find(commonName);
+     if (iter != cnDataMap.end()) {
+       std::swap(localQ, iter->second->vconnQ);
+-      iter->second->ctx    = std::move(ctx);
+-      iter->second->cert   = std::move(cert); ///< We might not need cert, can be easily removed
++      if (nullptr == iter->second->ctx) { // only set once, or coredump - fixed by adam 2019-07-26
++        iter->second->ctx    = std::move(ctx);
++        iter->second->cert   = std::move(cert); ///< We might not need cert, can be easily removed
++      }
+       iter->second->wontdo = wontdo;
+     }
+     TSMutexUnlock(list_mutex);
+@@ -308,9 +317,11 @@ static scoped_X509 ca_cert_scoped;
  static scoped_EVP_PKEY ca_pkey_scoped;
  // static scoped_EVP_PKEY  ts_pkey_scoped;
  
@@ -33,7 +46,7 @@ index 9415d75..30c2231 100644
  
  // Management Object
  static std::unique_ptr<SslLRUList> ssl_list = nullptr;
-@@ -349,9 +358,61 @@ mkcsr(const char *cn)
+@@ -349,9 +360,61 @@ mkcsr(const char *cn)
    return req;
  }
  
@@ -96,7 +109,7 @@ index 9415d75..30c2231 100644
  {
    TSDebug(PLUGIN_NAME, "Entering mkcrt()...");
    X509_NAME *subj, *tmpsubj;
-@@ -368,7 +429,15 @@ mkcrt(X509_REQ *req, int serial)
+@@ -368,7 +431,15 @@ mkcrt(X509_REQ *req, int serial)
  
    /// Set serial number
    // TSDebug("txn_monitor", "serial: %d", serial);
@@ -113,7 +126,7 @@ index 9415d75..30c2231 100644
  
    /// Set issuer from CA cert
    if (X509_set_issuer_name(cert.get(), X509_get_subject_name(ca_cert_scoped.get())) == 0) {
-@@ -376,8 +445,10 @@ mkcrt(X509_REQ *req, int serial)
+@@ -376,8 +447,10 @@ mkcrt(X509_REQ *req, int serial)
      return nullptr;
    }
    /// Set certificate time
@@ -126,7 +139,7 @@ index 9415d75..30c2231 100644
  
    /// Get a handle to csr subject name
    subj = X509_REQ_get_subject_name(req);
-@@ -402,6 +473,36 @@ mkcrt(X509_REQ *req, int serial)
+@@ -402,6 +475,36 @@ mkcrt(X509_REQ *req, int serial)
      return nullptr;
    }
  
@@ -163,7 +176,7 @@ index 9415d75..30c2231 100644
    X509_sign(cert.get(), ca_pkey_scoped.get(), EVP_sha256());
  
    return cert;
-@@ -469,6 +570,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
+@@ -469,6 +572,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
      }
      TSDebug(PLUGIN_NAME, "shadow_cert_generator(): Creating shadow certs");
  
@@ -171,7 +184,7 @@ index 9415d75..30c2231 100644
      /// Get serial number
      TSMutexLock(serial_mutex);
      int serial = ca_serial++;
-@@ -480,6 +582,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
+@@ -480,6 +584,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
      }
  
      TSMutexUnlock(serial_mutex);
@@ -179,7 +192,7 @@ index 9415d75..30c2231 100644
  
      /// Create CSR and cert
      req = mkcsr(commonName.c_str());
-@@ -490,7 +593,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
+@@ -490,7 +595,7 @@ shadow_cert_generator(TSCont contp, TSEvent event, void *edata)
        return TS_ERROR;
      }
  
@@ -188,7 +201,7 @@ index 9415d75..30c2231 100644
  
      if (cert == nullptr) {
        TSDebug(PLUGIN_NAME, "[shadow_cert_generator] Cert generation failed");
-@@ -593,12 +696,12 @@ TSPluginInit(int argc, const char *argv[])
+@@ -593,12 +698,12 @@ TSPluginInit(int argc, const char *argv[])
  
    const char *key    = nullptr;
    const char *cert   = nullptr;
@@ -203,7 +216,7 @@ index 9415d75..30c2231 100644
      {"store", required_argument, nullptr, 's'},       {nullptr, no_argument, nullptr, 0}};
  
    int opt = 0;
-@@ -614,10 +717,12 @@ TSPluginInit(int argc, const char *argv[])
+@@ -614,10 +719,12 @@ TSPluginInit(int argc, const char *argv[])
        key = optarg;
        break;
      }
@@ -216,7 +229,7 @@ index 9415d75..30c2231 100644
      case 'm': {
        ssl_list.reset(new SslLRUList(static_cast<int>(std::strtol(optarg, nullptr, 0))));
        break;
-@@ -642,7 +747,7 @@ TSPluginInit(int argc, const char *argv[])
+@@ -642,7 +749,7 @@ TSPluginInit(int argc, const char *argv[])
    } else if ((cb_shadow = TSContCreate(cert_retriever, nullptr)) == nullptr) {
      TSError("[%s] Unable to initialize plugin (disabled). Failed to create shadow cert cb.", PLUGIN_NAME);
    } else {
@@ -225,7 +238,7 @@ index 9415d75..30c2231 100644
        // Dynamic cert generation enabled. Initialize CA key, cert and serial
        // To comply to openssl, key and cert file are opened as FILE*
        FILE *fp = nullptr;
-@@ -668,6 +773,7 @@ TSPluginInit(int argc, const char *argv[])
+@@ -668,6 +775,7 @@ TSPluginInit(int argc, const char *argv[])
          return;
        }
  
@@ -233,7 +246,7 @@ index 9415d75..30c2231 100644
        // Read serial file
        serial_file.open(serial, std::fstream::in | std::fstream::out);
        if (!serial_file.is_open()) {
-@@ -684,6 +790,7 @@ TSPluginInit(int argc, const char *argv[])
+@@ -684,6 +792,7 @@ TSPluginInit(int argc, const char *argv[])
        if (serial_file.bad() || serial_file.fail()) {
          ca_serial = 0;
        }
