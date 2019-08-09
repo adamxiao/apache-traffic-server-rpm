@@ -1,0 +1,13 @@
+diff --git a/proxy/http/HttpTransact.cc b/proxy/http/HttpTransact.cc
+index f0fc16c..609b59d 100644
+--- a/proxy/http/HttpTransact.cc
++++ b/proxy/http/HttpTransact.cc
+@@ -4539,6 +4539,8 @@ HttpTransact::handle_cache_operation_on_forward_server_response(State *s)
+         s->cache_info.action = CACHE_DO_NO_ACTION;
+       } else if (s->method == HTTP_WKSIDX_HEAD) {
+         s->cache_info.action = CACHE_DO_NO_ACTION;
++      } else if (!s->negative_caching && server_response_code != HTTP_STATUS_OK) {
++        s->cache_info.action = CACHE_DO_NO_ACTION;
+       } else {
+         s->cache_info.action = CACHE_DO_WRITE;
+       }
