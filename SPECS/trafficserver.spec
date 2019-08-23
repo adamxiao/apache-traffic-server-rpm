@@ -6,7 +6,7 @@
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	7.1.6
-Release:	12%{?dist}
+Release:	13%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -17,7 +17,7 @@ Source2:	trafficserver.keyring
 Source3:	trafficserver.sysconf
 Source4:	trafficserver.service
 Source5:	trafficserver.tmpfilesd
-Source6:	kylin_tproxy.sh
+Source6:	extra_etc.tar
 Patch1:		trafficserver-init_scripts.patch
 
 Patch101:	trafficserver-6.2.0-require-s-maxage.patch
@@ -159,7 +159,7 @@ ln -s ../../..%{_localstatedir}/log/trafficserver %{buildroot}%{_prefix}%{_local
 mkdir -p %{buildroot}%{_localstatedir}/cache/trafficserver
 ln -s ../../..%{_localstatedir}/cache/trafficserver %{buildroot}%{_prefix}%{_localstatedir}/cache
 
-cp  %{SOURCE6} %{buildroot}%{_prefix}/bin
+tar -C %{buildroot}/etc/trafficserver -xf %{SOURCE6}
 
 %check
 %ifnarch ppc64
@@ -241,7 +241,6 @@ fi
 %{_prefix}%{_localstatedir}/run
 %{_prefix}%{_localstatedir}/logs
 %{_prefix}%{_localstatedir}/cache
-%{_bindir}/kylin_tproxy.sh
 
 %files perl
 %defattr(-,root,root,-)
@@ -258,6 +257,10 @@ fi
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
+* Fri Aug 23 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-13
+- update default configuration files: records.config, remap.config, etc.
+- remove kylin_tproxy.sh
+
 * Mon Aug 12 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-12
 - Collapsed forwarding support in ATS core
 - Add slice plugin, and certifier plugin
