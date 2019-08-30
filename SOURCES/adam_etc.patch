@@ -1,0 +1,243 @@
+diff --git a/proxy/config/Makefile.am b/proxy/config/Makefile.am
+index bcf31f5..cbe644c 100644
+--- a/proxy/config/Makefile.am
++++ b/proxy/config/Makefile.am
+@@ -27,6 +27,9 @@ nodist_sysconf_DATA = \
+   storage.config.default
+ 
+ dist_sysconf_DATA =	\
++  ca-serial.txt.default \
++  ca.pem.default \
++  route_connect.lua.default \
+   cache.config.default \
+   cluster.config.default \
+   congestion.config.default \
+diff --git a/proxy/config/ca-serial.txt.default b/proxy/config/ca-serial.txt.default
+new file mode 100644
+index 0000000..accdeee
+--- /dev/null
++++ b/proxy/config/ca-serial.txt.default
+@@ -0,0 +1 @@
++8676681146
+diff --git a/proxy/config/ca.pem.default b/proxy/config/ca.pem.default
+new file mode 100644
+index 0000000..d17e3b3
+--- /dev/null
++++ b/proxy/config/ca.pem.default
+@@ -0,0 +1,52 @@
++-----BEGIN PRIVATE KEY-----
++MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDSrvVKNVTIexCw
++6xf9BFawYe6aiKWlDCNkuFa7ar8BShbXEQT04UtPK4POBFhjd2r0MZb0Z8VqpNsf
++CuLgMlgR0TYjlrno4Q6TAQF9WJNe7Ak/6kTAVvmqZeG3zVHKCcEPzNcG8JGMaepD
++7qygDsmrRP9aEy86M6iKBwo/u5OMSRJTNmhQW+NNn1rPahDGJeb+TXuAJ3GjQgsY
++Dwobo94mi5lfAz6EFmd/6kXjGndvTs67OrvwZhjdIk911PxNwG/4rUEkncwMGf9L
+++fbZkCkl9t8dS8mmEeRIMg5TM8YIumQEGJHBa+MnhMjcfnk7+U5pWYukVDn3OKkd
++xMEM2EbfAgMBAAECggEBAMWZeM/4AyPhYL8+UAprtk7KGzrvLMUHBG8kAZzYOnsg
++HRnriYWPhM2lV4KzSp9H0pVjqVxjs6IZKrcLw8xZC4byfN+WL5m+86dmyxngKKBf
++qzE6LO9k49cwpSp5tNtUmLGUAp0spqZWdHTwdxHLrNQo64J0+deRueJzReaOrI1m
++C3d89qMo7tBMTJqUx3ZnlCJx6gUfD+TZ7GcE2T/hSRmPy6nQJINNCiz1k30myx0I
++uJq3vRN/mzEAOMbvLO3m8+C/yikJCjOTMl2pjOBvePJLz8k1kyj71BI/lOICXk3s
++yopftyKbWJbln5736mbTZunV17E7ZoV/bKvR48anu4ECgYEA8ipjEwZlkz28MhwW
++vRyRE65mICGe+YoNM9cGRsc9A0T+33db8rKttpepcMmTYAwFVkkip2glbAneqfMx
++U1BTU7+jXZbC1VNb1M6+u7aV7++Rrcmyoggm6p3evpl8q8cKNjQE+m4Q64h8j/AN
++KBrf9607LxuyIsqTpHCyVTqK1Z8CgYEA3rgnBEYlETr57KTgRvV7LRbYZAYOEZXl
++8O0kEQnQzvuVpGUoUTjcdpMVWHKCHP+jymdWyn9DF40Ck3ez39g9Jy+XCivUthsW
++8aGlFy+SCMsFy/iUE4cMfl6DrVgnJMi5azXLEzUTMZ6l57LQ09szi4gPJSZAQnF8
++Q79Q1kwkhsECgYAJB+Oh9f8bupWmGL4QV1xhq4NLd3WCQM+1OzOUuCFiWdRXaRAY
++wOkRgh5jgmDomAoq6ZdNPukGWmffVp5kSP6ShPcGqnShl/Y4vW0HewukYv6/yGHN
++ARjSbwi7euXXUhjjZJU68ZfX8MMUaxNSh44Kon8uho3iFkPjQgCkhQZgaQKBgGKb
++derWg6LVUcIMXaANH7Qe4T+nzqLKkzvQQp+okOKTUPWwM+GCI1n8VP8L87+TD5mV
++lz+giLvsmq9f2CvLOYgX8e926H6YD9h7kPRrA2URPkfIjwb2S/nHLtWYqfwHQtDM
++yFSAszbM3vdunDawXmnwm4P/I4RHapU0Jz46CBIBAoGAF5l3vDrzrN1c77Q9g4gv
++MEBFAlJrOaXkvG7mAzCLcGbN0fccY5TmI6gnIyUqwgiBLG3LxyAzAMZlTV/maKij
++IyOjd7zZhppKeaorIo8JEftbe1rO7yEK7gJIzZ54he90cblJN+qKvitFTUGnLG5p
++I1bucvHT5wIUxYByy7lq59s=
++-----END PRIVATE KEY-----
++-----BEGIN CERTIFICATE-----
++MIID7zCCAtegAwIBAgIJAI8L5jO/9f6xMA0GCSqGSIb3DQEBCwUAMIGNMQswCQYD
++VQQGEwJDTjEOMAwGA1UECAwFSHVOYW4xETAPBgNVBAcMCENoYW5nU2hhMQ4wDAYD
++VQQKDAVreWxpbjEMMAoGA1UECwwDZGV2MRswGQYDVQQDDBJ3d3cua3lsaW5vcy5j
++b20uY24xIDAeBgkqhkiG9w0BCQEWEWllZmN1eHlAZ21haWwuY29tMB4XDTE5MDYx
++ODAzMzUzMVoXDTI5MDYxNTAzMzUzMVowgY0xCzAJBgNVBAYTAkNOMQ4wDAYDVQQI
++DAVIdU5hbjERMA8GA1UEBwwIQ2hhbmdTaGExDjAMBgNVBAoMBWt5bGluMQwwCgYD
++VQQLDANkZXYxGzAZBgNVBAMMEnd3dy5reWxpbm9zLmNvbS5jbjEgMB4GCSqGSIb3
++DQEJARYRaWVmY3V4eUBnbWFpbC5jb20wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAw
++ggEKAoIBAQDSrvVKNVTIexCw6xf9BFawYe6aiKWlDCNkuFa7ar8BShbXEQT04UtP
++K4POBFhjd2r0MZb0Z8VqpNsfCuLgMlgR0TYjlrno4Q6TAQF9WJNe7Ak/6kTAVvmq
++ZeG3zVHKCcEPzNcG8JGMaepD7qygDsmrRP9aEy86M6iKBwo/u5OMSRJTNmhQW+NN
++n1rPahDGJeb+TXuAJ3GjQgsYDwobo94mi5lfAz6EFmd/6kXjGndvTs67OrvwZhjd
++Ik911PxNwG/4rUEkncwMGf9L+fbZkCkl9t8dS8mmEeRIMg5TM8YIumQEGJHBa+Mn
++hMjcfnk7+U5pWYukVDn3OKkdxMEM2EbfAgMBAAGjUDBOMB0GA1UdDgQWBBRvuCLE
++FzuRPdbrxrqgNCRneSt9TTAfBgNVHSMEGDAWgBRvuCLEFzuRPdbrxrqgNCRneSt9
++TTAMBgNVHRMEBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQDH5tkmqMafTe+Iief0
++Xq4+9NvNyfH8rGc+DRobWz5ytcXdbq/ZIv9AfFtHex4hJ3XTH1Bs/1rtHY/ysxmh
++iH56HXMXx3sJ+XcszHB7tzy9G2eFdLehYGI1C9XbqOZy0NsYF3ixi609puh17mrb
++JCjWkSXTCatFrMHvDee4YuYcDwT00Z12sSjAsavwaoSlmPehmmdiN1q4sUgrQVo1
++FxDTFm2j3JtkI/0u3C13kjBPYuNlcNfID3DeNAF9O9BHgJrviawlXZ97f8Y7VI6M
++TnVxK0slO3fqRK8xhHgk8Z5UvzHGUy4GxDfw5xMgdinY/44v+6wF8QuNRZ92ShZK
++CXBu
++-----END CERTIFICATE-----
+diff --git a/proxy/config/cache.config.default b/proxy/config/cache.config.default
+index f795978..f4311af 100644
+--- a/proxy/config/cache.config.default
++++ b/proxy/config/cache.config.default
+@@ -55,3 +55,17 @@
+ #
+ #  Revalidate all http objects from www.example.com after 2 hours 
+ #    dest_domain=www.example.com   scheme=http  revalidate=2h
++url_regex=.* suffix=xml  ttl-in-cache=5d
++url_regex=.* suffix=ts  ttl-in-cache=5d
++url_regex=.* suffix=jpeg  ttl-in-cache=5d
++url_regex=.* suffix=mp4  ttl-in-cache=5d
++url_regex=.* suffix=zip  ttl-in-cache=5d
++url_regex=.* suffix=gif  ttl-in-cache=5d
++url_regex=.* suffix=ppt  ttl-in-cache=5d
++url_regex=.* suffix=jpg  ttl-in-cache=5d
++url_regex=.* suffix=swf  ttl-in-cache=5d
++# cache http will login failed
++#url_regex=.* scheme=http  ttl-in-cache=1h
++url_regex=.* suffix=m3u8  ttl-in-cache=5d
++url_regex=.* suffix=js  ttl-in-cache=5d
++url_regex=.* suffix=css  ttl-in-cache=5d
+diff --git a/proxy/config/logging.config.default b/proxy/config/logging.config.default
+index af8d624..0c50b3d 100644
+--- a/proxy/config/logging.config.default
++++ b/proxy/config/logging.config.default
+@@ -133,7 +133,7 @@ squid_seconds_only_timestamp = format {
+ 
+ -- Squid Log Format.
+ squid = format {
+-  Format = '%<cqtq> %<ttms> %<chi> %<crc>/%<pssc> %<psql> %<cqhm> %<cquc> %<caun> %<phr>/%<pqsn> %<psct>'
++  Format = '%<cqtq> %<ttms> %<chi> %<crc>/%<pssc> %<psql> %<cqhm> %<cquc> %<caun> %<phr>/%<pqsn> %<psct> %<{Range}cqh>'
+ }
+ 
+ -- Common Log Format.
+diff --git a/proxy/config/plugin.config.default b/proxy/config/plugin.config.default
+index 1ccb9bd..0784ca2 100644
+--- a/proxy/config/plugin.config.default
++++ b/proxy/config/plugin.config.default
+@@ -13,3 +13,11 @@
+ #inktomi/iwx/iwx.so
+ #inktomi/abuse/abuse.so etc/trafficserver/abuse.config
+ #inktomi/icx/icx.so etc/trafficserver/icx.config
++
++xdebug.so --header=X-Debug
++
++certifier.so --store=etc/certs --max=1000 --sign-cert=etc/ca.pem --sign-key=etc/ca.pem --sign-serial=etc/ca-serial.txt
++
++tslua.so /etc/trafficserver/route_connect.lua
++
++#collapsed_forwarding.so --delay=500 --retries=5
+diff --git a/proxy/config/records.config.default.in b/proxy/config/records.config.default.in
+index fee4f6a..99eff0d 100644
+--- a/proxy/config/records.config.default.in
++++ b/proxy/config/records.config.default.in
+@@ -20,14 +20,15 @@ CONFIG proxy.config.exec_thread.affinity INT 1
+ # Specify server addresses and ports to bind for HTTP and HTTPS. Docs:
+ #    https://docs.trafficserver.apache.org/records.config#proxy.config.http.server_ports
+ ##############################################################################
+-CONFIG proxy.config.http.server_ports STRING 8080 8080:ipv6
++CONFIG proxy.config.http.server_ports STRING 3080 3443:proto=http:ssl
++CONFIG proxy.config.http.connect_ports STRING 443 3443 8443
+ 
+ ##############################################################################
+ # Via: headers. Docs:
+ #     https://docs.trafficserver.apache.org/records.config#proxy-config-http-insert-response-via-str
+ ##############################################################################
+-CONFIG proxy.config.http.insert_request_via_str INT 1
+-CONFIG proxy.config.http.insert_response_via_str INT 0
++CONFIG proxy.config.http.insert_request_via_str INT 0
++CONFIG proxy.config.http.insert_response_via_str INT 1
+ 
+ ##############################################################################
+ # Parent proxy configuration, in addition to these settings also see parent.config. Docs:
+@@ -48,7 +49,7 @@ CONFIG proxy.config.http.keep_alive_no_activity_timeout_in INT 120
+ CONFIG proxy.config.http.keep_alive_no_activity_timeout_out INT 120
+ CONFIG proxy.config.http.transaction_no_activity_timeout_in INT 30
+ CONFIG proxy.config.http.transaction_no_activity_timeout_out INT 30
+-CONFIG proxy.config.http.transaction_active_timeout_in INT 900
++CONFIG proxy.config.http.transaction_active_timeout_in INT 0
+ CONFIG proxy.config.http.transaction_active_timeout_out INT 0
+ CONFIG proxy.config.http.accept_no_activity_timeout INT 120
+ CONFIG proxy.config.net.default_inactivity_timeout INT 86400
+@@ -77,7 +78,7 @@ CONFIG proxy.config.http.negative_caching_lifetime INT 1800
+ #    https://docs.trafficserver.apache.org/records.config#proxy-user-variables
+ ##############################################################################
+ CONFIG proxy.config.http.insert_client_ip INT 1
+-CONFIG proxy.config.http.insert_squid_x_forwarded_for INT 1
++CONFIG proxy.config.http.insert_squid_x_forwarded_for INT 0
+ 
+ ##############################################################################
+ # Security. Docs:
+@@ -133,6 +134,7 @@ CONFIG proxy.config.cache.limits.http.max_alts INT 5
+     # https://docs.trafficserver.apache.org/records.config#proxy-config-cache-max-doc-size
+ CONFIG proxy.config.cache.max_doc_size INT 0
+ CONFIG proxy.config.cache.min_average_object_size INT 8000
++CONFIG proxy.config.cache.ram_cache.algorithm INT 1
+ 
+ ##############################################################################
+ # Logging Config. Docs:
+@@ -153,7 +155,7 @@ CONFIG proxy.config.log.periodic_tasks_interval INT 5
+ #    https://docs.trafficserver.apache.org/records.config#url-remap-rules
+ #    https://docs.trafficserver.apache.org/en/latest/admin-guide/files/remap.config.en.html
+ ##############################################################################
+-CONFIG proxy.config.url_remap.remap_required INT 1
++CONFIG proxy.config.url_remap.remap_required INT 0
+     # https://docs.trafficserver.apache.org/records.config#proxy-config-url-remap-pristine-host-hdr
+ CONFIG proxy.config.url_remap.pristine_host_hdr INT 0
+     # https://docs.trafficserver.apache.org/records.config#reverse-proxy
+@@ -177,3 +179,20 @@ CONFIG proxy.config.diags.debug.tags STRING http.*|dns.*
+ # ToDo: Undocumented
+ CONFIG proxy.config.dump_mem_info_frequency INT 0
+ CONFIG proxy.config.http.slow.log.threshold INT 0
++# cache inspect
++CONFIG proxy.config.http_ui_enabled INT 1
++
++
++CONFIG proxy.config.http.cache.open_write_fail_action INT          5
++#CONFIG proxy.config.http.cache.open_write_fail_action INT          1
++#CONFIG proxy.config.cache.enable_read_while_writer INT             1
++#CONFIG proxy.config.http.redirection_enabled INT                   1
++#CONFIG proxy.config.http.number_of_redirections INT                10
++#CONFIG proxy.config.http.redirect_use_orig_cache_key INT           1
++#CONFIG proxy.config.http.background_fill_active_timeout INT        0
++#CONFIG proxy.config.http.background_fill_completed_threshold FLOAT 0.0
++
++CONFIG proxy.config.cache.read_while_writer.max_retries INT        20
++CONFIG proxy.config.cache.read_while_writer_retry.delay INT        200
++CONFIG proxy.config.http.cache.max_open_write_retries INT 2
++CONFIG proxy.config.http.cache.open_read_retry_time INT 50
+diff --git a/proxy/config/route_connect.lua.default b/proxy/config/route_connect.lua.default
+new file mode 100644
+index 0000000..e4370e6
+--- /dev/null
++++ b/proxy/config/route_connect.lua.default
+@@ -0,0 +1,28 @@
++-- route_connect.lua
++function do_global_pre_remap()
++    local method = ts.client_request.get_method()
++    if not method or method ~= 'CONNECT' then
++        return
++    end
++
++    local url_host = ts.client_request.get_url_host()
++    if url_host == 'www.example.com' then
++    --if url_host ~= 'www.example.com' then
++        return
++    end
++
++    -- finally route method CONNECT to self, for certifier middle-in-man
++    ts.server_request.server_addr.set_addr("127.0.0.1", 3443, TS_LUA_AF_INET)
++    --ts.debug('route CONNECT to self: ' .. url_host)
++end
++
++-- negative_cache_disable.lua
++function do_global_cache_lookup_complete()
++    local cache_status = ts.http.get_cache_lookup_status()
++    if cache_status == TS_LUA_CACHE_LOOKUP_HIT_FRESH then
++        code = ts.cached_response.get_status()
++        if 200 ~= code and 206 ~= code then
++            ts.http.set_cache_lookup_status(TS_LUA_CACHE_LOOKUP_MISS)
++        end
++    end
++end

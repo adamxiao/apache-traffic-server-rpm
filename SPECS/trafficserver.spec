@@ -6,7 +6,7 @@
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	7.1.6
-Release:	13%{?dist}
+Release:	15%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -17,7 +17,9 @@ Source2:	trafficserver.keyring
 Source3:	trafficserver.sysconf
 Source4:	trafficserver.service
 Source5:	trafficserver.tmpfilesd
-Source6:	extra_etc.tar
+Source6:	remap.config
+Source7:	ats_setup.sh
+Source8:	ats_setup.uniqb.sh
 Patch1:		trafficserver-init_scripts.patch
 
 Patch101:	trafficserver-6.2.0-require-s-maxage.patch
@@ -28,6 +30,7 @@ Patch105:	adam_certifier_fix.patch
 Patch106:	adam_remap_enc.patch
 Patch107:	adam_disable_negative_cache.patch
 Patch108:	adam_core_collapsed_forwarding.patch
+Patch109:	adam_etc.patch
 
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
@@ -93,6 +96,7 @@ The trafficserver-perl package contains perl bindings.
 %patch106 -p1
 %patch107 -p1
 %patch108 -p1
+%patch109 -p1
 
 %build
 NOCONFIGURE=1 autoreconf -vif
@@ -159,7 +163,10 @@ ln -s ../../..%{_localstatedir}/log/trafficserver %{buildroot}%{_prefix}%{_local
 mkdir -p %{buildroot}%{_localstatedir}/cache/trafficserver
 ln -s ../../..%{_localstatedir}/cache/trafficserver %{buildroot}%{_prefix}%{_localstatedir}/cache
 
-tar -C %{buildroot}/etc/trafficserver -xf %{SOURCE6}
+mkdir -p %{buildroot}/etc/trafficserver/certs
+cp %{SOURCE6} %{buildroot}/etc/trafficserver
+cp %{SOURCE7} %{buildroot}%{_prefix}/bin
+cp %{SOURCE8} %{buildroot}%{_prefix}/bin
 
 %check
 %ifnarch ppc64
@@ -241,6 +248,8 @@ fi
 %{_prefix}%{_localstatedir}/run
 %{_prefix}%{_localstatedir}/logs
 %{_prefix}%{_localstatedir}/cache
+%{_bindir}/ats_setup.sh
+%{_bindir}/ats_setup.uniqb.sh
 
 %files perl
 %defattr(-,root,root,-)
@@ -257,6 +266,9 @@ fi
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
+* Mon Aug 26 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-15
+- add ats_setup.sh and ats_setup.uniqb.sh
+
 * Fri Aug 23 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-13
 - update default configuration files: records.config, remap.config, etc.
 - remove kylin_tproxy.sh
