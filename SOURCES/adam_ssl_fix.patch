@@ -1,0 +1,17 @@
+diff --git a/iocore/net/SSLNetVConnection.cc b/iocore/net/SSLNetVConnection.cc
+index 4490a7c..47c8c0f 100644
+--- a/iocore/net/SSLNetVConnection.cc
++++ b/iocore/net/SSLNetVConnection.cc
+@@ -1101,8 +1101,10 @@ SSLNetVConnection::sslServerHandShakeEvent(int &err)
+           }
+         } else if (retval == 0) {
+           // EOF, go away, we stopped in the handshake
+-          SSLDebugVC(this, "SSL handshake error: EOF");
+-          return EVENT_ERROR;
++          if (isEosRcvd()) {
++            SSLDebugVC(this, "SSL handshake error: EOF");
++            return EVENT_ERROR;
++          }
+         }
+       } else {
+         update_rbio(false);

@@ -6,7 +6,7 @@
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	6.2.3
-Release:	4%{?dist}
+Release:	5%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -25,6 +25,11 @@ Patch103:	adam_collapsed_fix.patch
 Patch104:	adam_collapsed_forwarding.patch
 Patch105:	adam_ts_lua_fix.patch
 Patch106:	adam_certifier_fix.patch
+Patch107:	adam_ssl_fix.patch
+Patch108:	adam_core_collapsed_forwarding.patch
+#Patch109:	adam_remap_enc.patch
+#Patch110:	adam_disable_negative_cache.patch
+#Patch111:	adam_etc.patch
 
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
@@ -89,6 +94,8 @@ The trafficserver-perl package contains perl bindings.
 %patch104 -p1
 %patch105 -p1
 %patch106 -p1
+%patch107 -p1
+%patch108 -p1
 
 %build
 NOCONFIGURE=1 autoreconf -vif
@@ -253,6 +260,15 @@ fi
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
+* Sun Sep  1 2019 Adam Xiao <iefcuxy@gmail.com> - 6.2.0-5
+- adam_certifier_slice.patch: add certifier,slice plugin from ats9.0.0
+- adam_collapsed_fix.patch: fix collapsed_forwarding plugin use range cache
+- adam_collapsed_forwarding.patch: global plugin support for collapsed_forwarding from ats8.0.3
+- adam_ts_lua_fix.patch: add server addr setting for ts_lua plugin
+- adam_certifier_fix.patch: fix plugin certifier coredump bug
+- adam_ssl_fix.patch: https with certifier plugin first time EOF fix
+- adam_core_collapsed_forwarding.patch: add core collapsed forwarding action
+
 * Sat Aug 27 2016 Bryan Seitz <seitz@ghettoforge.org> - 6.2.0-1
 - Imported into GhettoForge
 
