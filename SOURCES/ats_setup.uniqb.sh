@@ -1,5 +1,62 @@
 #!/bin/bash
 
+gen_pac_file()
+{
+	pac_file=$1
+	cat > $pac_file << EOF
+function FindProxyForURL(url, host)
+{
+	/* Normalize the URL for pattern matching */
+	host = host.toLowerCase();
+
+	var KYLIN_PROXY = "" +
+		"DIRECT"; // 默认走代理，如果失败，则直接连接
+
+	var jz_sites = [
+		'jdvodrvfb210d.vod.126.net',
+	];
+
+	var jz_domain = [
+		'.icourse163.org',
+		'.xuetangx.com',
+		'.mooc.com',
+		'.cnmooc.org',
+		'.zhihuishu.com',
+		'.chinesemooc.org',
+	];
+
+	for (var i = 0; i < jz_sites.length; i++) {
+		if (host == jz_sites[i]) {
+			return KYLIN_PROXY;
+		}
+	}
+
+	for (var i = 0; i < jz_domain.length; i++) {
+		if (dnsDomainIs(host, jz_domain[i])) {
+			return KYLIN_PROXY;
+		}
+	}
+
+	return 'DIRECT';
+}
+EOF
+}
+
+pac_setup()
+{
+	PROXY_IP="$1"
+	pac_file="/home/kylin-ksvd/.ksvd-local/kylin_proxy.pac"
+	if [[ ! -f $pac_file ]]; then
+		gen_pac_file $pac_file
+	fi
+
+	if [[ "" != "$PROXY_IP" ]]; then
+		sed -i -e 's/^\s*var\sKYLIN_PROXY\s.*$/\tvar KYLIN_PROXY = "PROXY 10.20.1.100:3080; " +/' $pac_file
+	else
+		sed -i -e 's/^\s*var\sKYLIN_PROXY\s.*$/\tvar KYLIN_PROXY = "" +/' $pac_file
+	fi
+}
+
 ats_setup()
 {
     settings_global_mc="/home/kylin-ksvd/.ksvd/settings.global.mc"
@@ -47,6 +104,9 @@ ats_setup()
             iptables -t nat -A PREROUTING ! -s $UNIQB_ATS_IP/32 -p tcp -m tcp --dport 443 -j KYLIN_TPROXY
         fi
 
+        # 3. 更新pac文件
+        pac_setup $UNIQB_ATS_IP
+
     else
         # 1. 透明代理禁用
         iptables -t nat -S PREROUTING | grep "^-A" | grep KYLIN_TPROXY | sed -e 's/^-A/-D/' -e 's/^/iptables -t nat /' | sh -e
@@ -54,6 +114,9 @@ ats_setup()
         iptables -t nat -X KYLIN_TPROXY
         # 2. 停止缓存服务
         systemctl disable trafficserver && systemctl stop trafficserver
+
+        # 3. 更新pac文件
+        pac_setup
     fi
 }
 
