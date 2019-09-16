@@ -6,7 +6,7 @@
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	7.1.6
-Release:	16%{?dist}
+Release:	17%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -20,6 +20,8 @@ Source5:	trafficserver.tmpfilesd
 Source6:	remap.config
 Source7:	ats_setup.sh
 Source8:	ats_setup.uniqb.sh
+Source101:	xuetangx.conf
+Source102:	storagecdn.xuetangx.com.conf
 Patch1:		trafficserver-init_scripts.patch
 
 Patch101:	trafficserver-6.2.0-require-s-maxage.patch
@@ -31,6 +33,7 @@ Patch106:	adam_remap_enc.patch
 Patch107:	adam_disable_negative_cache.patch
 Patch108:	adam_core_collapsed_forwarding.patch
 Patch109:	adam_etc.patch
+Patch110:	adam_true_rww.patch
 
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
@@ -97,6 +100,7 @@ The trafficserver-perl package contains perl bindings.
 %patch107 -p1
 %patch108 -p1
 %patch109 -p1
+%patch110 -p1
 
 %build
 NOCONFIGURE=1 autoreconf -vif
@@ -167,6 +171,9 @@ mkdir -p %{buildroot}/etc/trafficserver/certs
 cp %{SOURCE6} %{buildroot}/etc/trafficserver
 cp %{SOURCE7} %{buildroot}%{_prefix}/bin
 cp %{SOURCE8} %{buildroot}%{_prefix}/bin
+
+cp %{SOURCE101} %{buildroot}/etc/trafficserver
+cp %{SOURCE102} %{buildroot}/etc/trafficserver
 
 %check
 %ifnarch ppc64
@@ -266,6 +273,10 @@ fi
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
+* Mon Sep 16 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-17
+- add true read while writer patch
+- update default configuration file, cache more
+
 * Tue Sep  3 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-16
 - update ats_setup.uniqb.sh: auto gen and update pac file
 

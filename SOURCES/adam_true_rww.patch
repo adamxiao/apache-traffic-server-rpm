@@ -1,0 +1,259 @@
+diff --git a/iocore/cache/Cache.cc b/iocore/cache/Cache.cc
+index 2640546..a2b23b7 100644
+--- a/iocore/cache/Cache.cc
++++ b/iocore/cache/Cache.cc
+@@ -77,6 +77,7 @@ int cache_config_agg_write_backlog             = AGG_SIZE * 2;
+ int cache_config_enable_checksum               = 0;
+ int cache_config_alt_rewrite_max_size          = 4096;
+ int cache_config_read_while_writer             = 0;
++int cache_config_read_while_writer_ext         = 0;
+ int cache_config_mutex_retry_delay             = 2;
+ int cache_read_while_writer_retry_delay        = 50;
+ int cache_config_read_while_writer_max_retries = 10;
+@@ -303,6 +304,15 @@ update_cache_config(const char * /* name ATS_UNUSED */, RecDataT /* data_type AT
+   return 0;
+ }
+ 
++static int
++update_rww_cache_config(const char * /* name ATS_UNUSED */, RecDataT /* data_type ATS_UNUSED */, RecData data,
++                    void * /* cookie ATS_UNUSED */)
++{
++  cache_config_read_while_writer_ext = data.rec_int;
++
++  return 0;
++}
++
+ CacheVC::CacheVC() : alternate_index(CACHE_ALT_INDEX_DEFAULT)
+ {
+   size_to_init = sizeof(CacheVC) - (size_t) & ((CacheVC *)nullptr)->vio;
+@@ -3282,6 +3292,10 @@ ink_cache_init(ModuleVersion v)
+   REC_EstablishStaticConfigInt32(cache_config_alt_rewrite_max_size, "proxy.config.cache.alt_rewrite_max_size");
+   Debug("cache_init", "proxy.config.cache.alt_rewrite_max_size = %d", cache_config_alt_rewrite_max_size);
+ 
++  REC_EstablishStaticConfigInt32(cache_config_read_while_writer_ext, "proxy.config.cache.enable_read_while_writer_ext");
++  REC_RegisterConfigUpdateFunc("proxy.config.cache.enable_read_while_writer_ext", update_rww_cache_config, nullptr);
++  Debug("cache_init", "proxy.config.cache.enable_read_while_writer_ext = %d", cache_config_read_while_writer_ext);
++
+   REC_EstablishStaticConfigInt32(cache_config_read_while_writer, "proxy.config.cache.enable_read_while_writer");
+   cache_config_read_while_writer = validate_rww(cache_config_read_while_writer);
+   REC_RegisterConfigUpdateFunc("proxy.config.cache.enable_read_while_writer", update_cache_config, nullptr);
+diff --git a/iocore/cache/CacheRead.cc b/iocore/cache/CacheRead.cc
+index 7f77ed2..9cdecee 100644
+--- a/iocore/cache/CacheRead.cc
++++ b/iocore/cache/CacheRead.cc
+@@ -287,6 +287,108 @@ CacheVC::openReadChooseWriter(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSE
+   return EVENT_NONE;
+ }
+ 
++TS_INLINE IOBufferBlock *
++iobufferblock_consume(IOBufferBlock *b, int64_t *poffset, int64_t *plen, int64_t write)
++{
++  int64_t offset = *poffset;
++  int64_t len    = write;
++
++  while (b && len >= 0) {
++    int64_t max_bytes = b->read_avail();
++
++    // If this block ends before the start offset, skip it
++    // and adjust the offset to consume its length.
++    max_bytes -= offset;
++    if (max_bytes < 0) {
++      offset = -max_bytes;
++      b      = b->next.get();
++      continue;
++    }
++
++    if (len > max_bytes) {
++      b = b->next.get();
++      len -= max_bytes;
++      offset = 0;
++    } else {
++      offset = offset + len;
++      break;
++    }
++  }
++
++  *poffset = offset;
++  *plen -= write;
++  return b;
++}
++
++// FIXME: use iobufferreader::read_avail
++TS_INLINE int64_t
++iobufferblock_read_avail(IOBufferBlock *b, int64_t start_offset=0)
++{
++  int64_t t        = 0;
++
++  while (b) {
++    t += b->read_avail();
++    b = b->next.get();
++  }
++
++  t -= start_offset;
++
++  return t;
++}
++
++// refer openReadFromWriterMain
++int
++CacheVC::openReadFromWriterBlocks(int /* event ATS_UNUSED */, Event * /* e ATS_UNUSED */)
++{
++  cancel_trigger();
++  if (seek_to) {
++    vio.ndone = seek_to;
++    seek_to   = 0;
++  }
++  IOBufferBlock *b = nullptr;
++  int64_t ntodo    = vio.ntodo();
++
++  if (!writer_buf) {
++    return calluser(VC_EVENT_EOS);
++  }
++
++  length = iobufferblock_read_avail(writer_buf.get(), writer_offset);
++  if (length <= 0) {
++    if (*(int *)rww_close_flag->data()) {
++      DDebug("cache_read_agg", "true read while write EOS, return");
++      return calluser(VC_EVENT_EOS);
++    }
++
++    // FIXME: retry timeout?
++    VC_SCHED_WRITER_RETRY();
++  }
++  //writer_lock_retry = 0;
++
++  if (ntodo <= 0)
++    return EVENT_CONT;
++
++  int64_t bytes = length;
++  if (bytes > vio.ntodo())
++    bytes = vio.ntodo();
++  if (vio.ndone >= (int64_t)doc_len) {
++    ink_assert(bytes <= 0);
++    // reached the end of the document and the user still wants more
++    return calluser(VC_EVENT_EOS);
++  }
++  b = iobufferblock_clone(writer_buf.get(), writer_offset, bytes);
++  if (!b) {
++    return calluser(VC_EVENT_EOS);
++  }
++  writer_buf = iobufferblock_consume(writer_buf.get(), &writer_offset, &length, bytes);
++  vio.buffer.writer()->append_block(b);
++  vio.ndone += bytes;
++  if (vio.ntodo() <= 0)
++    return calluser(VC_EVENT_READ_COMPLETE);
++  else
++    return calluser(VC_EVENT_READ_READY);
++}
++
++
+ int
+ CacheVC::openReadFromWriter(int event, Event *e)
+ {
+@@ -363,7 +465,9 @@ CacheVC::openReadFromWriter(int event, Event *e)
+   }
+   // allow reading from unclosed writer for http requests only.
+   ink_assert(frag_type == CACHE_FRAG_TYPE_HTTP || write_vc->closed);
+-  if (!write_vc->closed && !write_vc->fragment) {
++  if (!write_vc->closed && !write_vc->fragment
++      // true read while writer - added by xiaoyun 2019-09-16
++      && !(write_vc->length && cache_config_read_while_writer_ext)) {
+     if (!cache_config_read_while_writer || frag_type != CACHE_FRAG_TYPE_HTTP ||
+         writer_lock_retry >= cache_config_read_while_writer_max_retries) {
+       MUTEX_RELEASE(lock);
+@@ -448,6 +552,27 @@ CacheVC::openReadFromWriter(int event, Event *e)
+     SET_HANDLER(&CacheVC::openReadStartEarliest);
+     return openReadStartEarliest(event, e);
+   }
++
++  // true read while writer - added by xiaoyun 2019-09-16
++  if (write_vc->length && cache_config_read_while_writer_ext) {
++    rww_close_flag = write_vc->rww_close_flag;
++    writer_buf    = write_vc->blocks;
++    writer_offset = write_vc->offset;
++    length        = write_vc->length;
++    f.single_fragment = !write_vc->fragment; // FIXME: single fragment doc?
++    doc_pos           = 0;
++    earliest_key      = write_vc->earliest_key;
++    ink_assert(earliest_key == key);
++    doc_len = write_vc->vio.nbytes; // FIXME: doc len ok?
++    dir_clean(&first_dir); // why?
++    dir_clean(&earliest_dir);
++    DDebug("cache_read_agg", "%p: key: %X %X: single fragment read", this, first_key.slice32(1), key.slice32(0));
++    MUTEX_RELEASE(writer_lock);
++    SET_HANDLER(&CacheVC::openReadFromWriterBlocks);
++    CACHE_INCREMENT_DYN_STAT(cache_read_busy_success_stat);
++    return callcont(CACHE_EVENT_OPEN_READ);
++  }
++
+   writer_buf    = write_vc->blocks;
+   writer_offset = write_vc->offset;
+   length        = write_vc->length;
+diff --git a/iocore/cache/CacheWrite.cc b/iocore/cache/CacheWrite.cc
+index 72efb68..e1653a2 100644
+--- a/iocore/cache/CacheWrite.cc
++++ b/iocore/cache/CacheWrite.cc
+@@ -1365,6 +1365,8 @@ Lagain:
+     towrite = MAX_FRAG_SIZE;
+   }
+   if (!blocks && towrite) {
++    rww_close_flag = new_IOBufferData(BUFFER_SIZE_INDEX_128);
++    *(int *)rww_close_flag->data() = 0;
+     blocks = vio.buffer.reader()->block;
+     offset = vio.buffer.reader()->start_offset;
+   }
+diff --git a/iocore/cache/P_CacheInternal.h b/iocore/cache/P_CacheInternal.h
+index e70460b..6670b7f 100644
+--- a/iocore/cache/P_CacheInternal.h
++++ b/iocore/cache/P_CacheInternal.h
+@@ -217,6 +217,7 @@ extern int cache_config_agg_write_backlog;
+ extern int cache_config_enable_checksum;
+ extern int cache_config_alt_rewrite_max_size;
+ extern int cache_config_read_while_writer;
++extern int cache_config_read_while_writer_ext;
+ extern int cache_clustering_enabled;
+ extern int cache_config_agg_write_backlog;
+ extern int cache_config_ram_cache_compress;
+@@ -331,6 +332,8 @@ struct CacheVC : public CacheVConnection {
+   int openReadFromWriterMain(int event, Event *e);
+   int openReadFromWriterFailure(int event, Event *);
+   int openReadChooseWriter(int event, Event *e);
++  // true read while write - added by adam 2019-09-16
++  int openReadFromWriterBlocks(int event, Event *e);
+ 
+   int openWriteCloseDir(int event, Event *e);
+   int openWriteCloseHeadDone(int event, Event *e);
+@@ -431,6 +434,7 @@ struct CacheVC : public CacheVConnection {
+   Ptr<IOBufferData> first_buf;
+   Ptr<IOBufferBlock> blocks; // data available to write
+   Ptr<IOBufferBlock> writer_buf;
++  Ptr<IOBufferData> rww_close_flag; // read while writer close flag
+ 
+   OpenDirEntry *od;
+   AIOCallbackInternal io;
+@@ -622,6 +626,12 @@ free_CacheVC(CacheVC *cont)
+   cont->mutex.clear();
+   cont->buf.clear();
+   cont->first_buf.clear();
++  if (cont->rww_close_flag) {
++    if (cont->f.readers) {
++      *(int *)cont->rww_close_flag->data() = 1;
++    }
++    cont->rww_close_flag.clear();
++  }
+   cont->blocks.clear();
+   cont->writer_buf.clear();
+   cont->alternate_index = CACHE_ALT_INDEX_DEFAULT;
+diff --git a/mgmt/RecordsConfig.cc b/mgmt/RecordsConfig.cc
+index 6dc16f8..fd6bdf7 100644
+--- a/mgmt/RecordsConfig.cc
++++ b/mgmt/RecordsConfig.cc
+@@ -992,6 +992,8 @@ static const RecordElement RecordsConfig[] =
+   ,
+   {RECT_CONFIG, "proxy.config.cache.enable_read_while_writer", RECD_INT, "1", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+   ,
++  {RECT_CONFIG, "proxy.config.cache.enable_read_while_writer_ext", RECD_INT, "0", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
++  ,
+   {RECT_CONFIG, "proxy.config.cache.mutex_retry_delay", RECD_INT, "2", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
+   ,
+   {RECT_CONFIG, "proxy.config.cache.read_while_writer.max_retries", RECD_INT, "10", RECU_DYNAMIC, RR_NULL, RECC_NULL, nullptr, RECA_NULL}
