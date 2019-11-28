@@ -6,7 +6,7 @@
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	7.1.6
-Release:	19%{?dist}
+Release:	20%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -273,6 +273,9 @@ fi
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
+* Tue Nov 19 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-20
+- update remap.config, add http://1.2.3.4 regex_map
+
 * Wed Oct 30 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-19
 - update ats_setup.uniqb.sh
 
