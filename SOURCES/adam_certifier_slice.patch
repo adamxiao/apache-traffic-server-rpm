@@ -784,10 +784,10 @@ index 0000000..9415d75
 +}
 diff --git a/plugins/experimental/slice/Config.cc b/plugins/experimental/slice/Config.cc
 new file mode 100644
-index 0000000..2a6ed11
+index 0000000..7f1ec3c
 --- /dev/null
 +++ b/plugins/experimental/slice/Config.cc
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,202 @@
 +/** @file
 +  Licensed to the Apache Software Foundation (ASF) under one
 +  or more contributor license agreements.  See the NOTICE file
@@ -886,6 +886,7 @@ index 0000000..2a6ed11
 +    {const_cast<char *>("test-blockbytes"), required_argument, nullptr, 't'},
 +    {const_cast<char *>("pace-errorlog"), required_argument, nullptr, 'p'},
 +    {const_cast<char *>("disable-errorlog"), no_argument, nullptr, 'd'},
++    {const_cast<char *>("only-slice-range-req"), no_argument, nullptr, 'r'},
 +    {nullptr, 0, nullptr, 0},
 +  };
 +
@@ -893,7 +894,7 @@ index 0000000..2a6ed11
 +  char *const *argvp = ((char *const *)argv - 1);
 +
 +  for (;;) {
-+    int const opt = getopt_long(argc + 1, argvp, "b:t:p:d", longopts, nullptr);
++    int const opt = getopt_long(argc + 1, argvp, "b:t:p:d:r", longopts, nullptr);
 +    if (-1 == opt) {
 +      break;
 +    }
@@ -934,6 +935,9 @@ index 0000000..2a6ed11
 +    case 'd':
 +      m_paceerrsecs = -1;
 +      break;
++    case 'r':
++      m_only_slice_range = true;
++      break;
 +    default:
 +      break;
 +    }
@@ -952,6 +956,11 @@ index 0000000..2a6ed11
 +    DEBUG_LOG("Block stitching error logs enabled");
 +  } else {
 +    DEBUG_LOG("Block stitching error logs at most every %d sec(s)", m_paceerrsecs);
++  }
++  if (m_only_slice_range) {
++    DEBUG_LOG("Only slice range request");
++  } else {
++    DEBUG_LOG("Slice all client request");
 +  }
 +
 +  return true;
@@ -983,10 +992,10 @@ index 0000000..2a6ed11
 +}
 diff --git a/plugins/experimental/slice/Config.h b/plugins/experimental/slice/Config.h
 new file mode 100644
-index 0000000..8c4ab24
+index 0000000..c692232
 --- /dev/null
 +++ b/plugins/experimental/slice/Config.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,47 @@
 +/** @file
 +  Licensed to the Apache Software Foundation (ASF) under one
 +  or more contributor license agreements.  See the NOTICE file
@@ -1019,6 +1028,7 @@ index 0000000..8c4ab24
 +
 +  int64_t m_blockbytes{blockbytesdefault};
 +  int m_paceerrsecs{0}; // -1 disable logging, 0 no pacing, max 60s
++  bool m_only_slice_range{false}; // only slice range request
 +
 +  // Convert optarg to bytes
 +  static int64_t bytesFrom(char const *const valstr);
@@ -3708,10 +3718,10 @@ index 0000000..c0d77e4
 +void handle_server_resp(TSCont contp, TSEvent event, Data *const data);
 diff --git a/plugins/experimental/slice/slice.cc b/plugins/experimental/slice/slice.cc
 new file mode 100644
-index 0000000..5b5c90b
+index 0000000..6d7adea
 --- /dev/null
 +++ b/plugins/experimental/slice/slice.cc
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,212 @@
 +/** @file
 +  Licensed to the Apache Software Foundation (ASF) under one
 +  or more contributor license agreements.  See the NOTICE file
@@ -3756,6 +3766,12 @@ index 0000000..5b5c90b
 +
 +  if (TS_HTTP_METHOD_GET == header.method()) {
 +    static int const SLICER_MIME_LEN_INFO = strlen(SLICER_MIME_FIELD_INFO);
++
++    if (config->m_only_slice_range
++        && !header.hasKey(TS_MIME_FIELD_RANGE, TS_MIME_LEN_RANGE)) {
++      return false;
++    }
++
 +    if (!header.hasKey(SLICER_MIME_FIELD_INFO, SLICER_MIME_LEN_INFO)) {
 +      // turn off any and all transaction caching (shouldn't matter)
 +      TSHttpTxnServerRespNoStoreSet(txnp, 1);
