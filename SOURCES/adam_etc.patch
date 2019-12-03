@@ -97,7 +97,7 @@ index f795978..f8fd860 100644
 +url_regex=.* suffix=swf  ttl-in-cache=5d
 +# cache http will login failed
 +#url_regex=.* scheme=http  ttl-in-cache=1h
-+url_regex=.* suffix=m3u8  ttl-in-cache=5d
++#url_regex=.* suffix=m3u8  ttl-in-cache=5d
 +url_regex=.* suffix=js  ttl-in-cache=5d
 +url_regex=.* suffix=css  ttl-in-cache=5d
 diff --git a/proxy/config/logging.config.default b/proxy/config/logging.config.default
