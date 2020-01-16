@@ -13,7 +13,8 @@ add_proxy()
     iptables -t nat -A KYLIN_TPROXY -p tcp -m tcp --dport 80 -j DNAT --to-destination $PROXY_IP:3080
     iptables -t nat -A KYLIN_TPROXY -p tcp -m tcp --dport 443 -j DNAT --to-destination $PROXY_IP:3443
     iptables -t nat -A PREROUTING ! -s $PROXY_IP/32 -p tcp -m tcp --dport 80 -j KYLIN_TPROXY
-    iptables -t nat -A PREROUTING ! -s $PROXY_IP/32 -p tcp -m tcp --dport 443 -j KYLIN_TPROXY
+    # disable https transparent proxy
+    #iptables -t nat -A PREROUTING ! -s $PROXY_IP/32 -p tcp -m tcp --dport 443 -j KYLIN_TPROXY
 }
 
 del_proxy()

@@ -6,7 +6,7 @@
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	7.1.6
-Release:	22%{?dist}
+Release:	23%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -273,6 +273,9 @@ fi
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
+* Tue Dec 10 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-23
+- update ats_setup.sh: disable https transparent proxy
+
 * Tue Dec 03 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-22
 - slice plugin add --only-slice-range-req, update remap.config only-slice-range-req
 

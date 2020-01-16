@@ -108,7 +108,8 @@ ats_setup()
         if [[ "" != "$UNIQB_ATS_IP" ]]; then
             iptables -t nat -N KYLIN_TPROXY
             iptables -t nat -A KYLIN_TPROXY -p tcp -m tcp --dport 80 -j DNAT --to-destination $UNIQB_ATS_IP:3080
-            iptables -t nat -A KYLIN_TPROXY -p tcp -m tcp --dport 443 -j DNAT --to-destination $UNIQB_ATS_IP:3443
+            # disable https transparent proxy
+            #iptables -t nat -A KYLIN_TPROXY -p tcp -m tcp --dport 443 -j DNAT --to-destination $UNIQB_ATS_IP:3443
             iptables -t nat -A PREROUTING ! -s $UNIQB_ATS_IP/32 -p tcp -m tcp --dport 80 -j KYLIN_TPROXY
             iptables -t nat -A PREROUTING ! -s $UNIQB_ATS_IP/32 -p tcp -m tcp --dport 443 -j KYLIN_TPROXY
         fi
