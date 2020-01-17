@@ -3,10 +3,12 @@
 # https://fedoraproject.org/wiki/Packaging:Guidelines#PIE
 %define _hardened_build 1
 
+%define _unpackaged_files_terminate_build 0
+
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	7.1.6
-Release:	22%{?dist}
+Release:	23%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -34,6 +36,8 @@ Patch107:	adam_disable_negative_cache.patch
 Patch108:	adam_core_collapsed_forwarding.patch
 Patch109:	adam_etc.patch
 Patch110:	adam_true_rww.patch
+Patch111:	adam_luajit.patch
+Patch112:	adam_arm64_build.patch
 
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
@@ -101,6 +105,8 @@ The trafficserver-perl package contains perl bindings.
 %patch108 -p1
 %patch109 -p1
 %patch110 -p1
+%patch111 -p1
+%patch112 -p1
 
 %build
 NOCONFIGURE=1 autoreconf -vif
@@ -273,6 +279,9 @@ fi
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
+* Thu Jan 16 2020 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-23
+- update luajit 2.0.4 to luajit 2.1.0-beta3, compile ok for arm64
+
 * Tue Dec 03 2019 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-22
 - slice plugin add --only-slice-range-req, update remap.config only-slice-range-req
 
