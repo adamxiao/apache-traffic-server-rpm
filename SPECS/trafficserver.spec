@@ -3,7 +3,7 @@
 # https://fedoraproject.org/wiki/Packaging:Guidelines#PIE
 %define _hardened_build 1
 
-%define _unpackaged_files_terminate_build 0
+%define _unpackaged_files_terminate_build 1
 
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
@@ -149,6 +149,8 @@ find %{buildroot} -type f -name "*.a" -delete
 
 rm -f %{buildroot}/%{_prefix}/lib/perl5/x86_64-linux-thread-multi/perllocal.pod
 rm -f %{buildroot}/%{_prefix}/lib/perl5/x86_64-linux-thread-multi/auto/Apache/TS/.packlist
+rm -f %{buildroot}/%{_prefix}/lib/perl5/aarch64-linux-thread-multi/perllocal.pod
+rm -f %{buildroot}/%{_prefix}/lib/perl5/aarch64-linux-thread-multi/auto/Apache/TS/.packlist
 
 #
 perl -pi -e 's/^CONFIG.*proxy.config.proxy_name STRING.*$/CONFIG proxy.config.proxy_name STRING FIXME.example.com/' \
@@ -157,6 +159,12 @@ perl -pi -e 's/^CONFIG.*proxy.config.ssl.server.cert.path.*$/CONFIG proxy.config
 	%{buildroot}/etc/trafficserver/records.config
 perl -pi -e 's/^CONFIG.*proxy.config.ssl.server.private_key.path.*$/CONFIG proxy.config.ssl.server.private_key.path STRING \/etc\/pki\/tls\/private\//' \
 	%{buildroot}/etc/trafficserver/records.config
+
+%ifarch aarch64
+perl -pi -e 's/^tslua.so/#tslua.so/' \
+        %{buildroot}/opt/trafficserver/etc/plugin.config
+%endif
+
 
 mkdir -p %{buildroot}%{_sysconfdir}
 mv %{buildroot}%{_prefix}%{_sysconfdir} %{buildroot}%{_sysconfdir}/trafficserver
