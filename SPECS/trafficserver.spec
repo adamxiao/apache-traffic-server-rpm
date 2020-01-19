@@ -42,7 +42,7 @@ Patch112:	adam_arm64_build.patch
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 # fails on ARMv7 atm (needs investigation), s390 unsupported
-ExcludeArch:	%{arm} s390 s390x
+ExcludeArch:	%{arm} s390 s390x x86_64 i686
 
 BuildRequires:	boost-devel
 BuildRequires:	gcc-c++
