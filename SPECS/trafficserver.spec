@@ -8,7 +8,7 @@
 Summary:	Fast, scalable and extensible HTTP/1.1 compliant caching proxy server
 Name:		trafficserver
 Version:	7.1.6
-Release:	23%{?dist}
+Release:	24%{?dist}
 License:	ASL 2.0
 Group:		System Environment/Daemons
 URL:		http://trafficserver.apache.org/index.html
@@ -36,13 +36,15 @@ Patch107:	adam_disable_negative_cache.patch
 Patch108:	adam_core_collapsed_forwarding.patch
 Patch109:	adam_etc.patch
 Patch110:	adam_true_rww.patch
+%ifarch aarch64
 Patch111:	adam_luajit.patch
 Patch112:	adam_arm64_build.patch
+%endif
 
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 # fails on ARMv7 atm (needs investigation), s390 unsupported
-ExcludeArch:	%{arm} s390 s390x x86_64 i686
+ExcludeArch:	%{arm} s390 s390x
 
 BuildRequires:	boost-devel
 BuildRequires:	gcc-c++
@@ -105,8 +107,10 @@ The trafficserver-perl package contains perl bindings.
 %patch108 -p1
 %patch109 -p1
 %patch110 -p1
+%ifarch aarch64
 %patch111 -p1
 %patch112 -p1
+%endif
 
 %build
 NOCONFIGURE=1 autoreconf -vif
@@ -287,6 +291,9 @@ fi
 %{_libdir}/pkgconfig/trafficserver.pc
 
 %changelog
+* Thu Feb 13 2020 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-24
+- for x86 and arm both build
+
 * Thu Jan 16 2020 Xiao Yun <xiaoyun@kylinos.com.cn> 7.1.6-23
 - update luajit 2.0.4 to luajit 2.1.0-beta3, compile ok for arm64
 
