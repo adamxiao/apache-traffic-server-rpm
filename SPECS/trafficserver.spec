@@ -36,10 +36,8 @@ Patch107:	adam_disable_negative_cache.patch
 Patch108:	adam_core_collapsed_forwarding.patch
 Patch109:	adam_etc.patch
 Patch110:	adam_true_rww.patch
-%ifarch aarch64
 Patch111:	adam_luajit.patch
 Patch112:	adam_arm64_build.patch
-%endif
 
 # BuildRoot is only needed for EPEL5:
 BuildRoot:	%(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
